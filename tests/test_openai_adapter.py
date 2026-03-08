@@ -566,6 +566,39 @@ class TestOpenAIAdapter:
 
         assert result.id == "chatcmpl-custom123"
 
+    def test_format_response_uses_explicit_reasoning_content(self, adapter):
+        """Explicit reasoning_content should be preserved without think tags."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        response = InternalResponse(
+            text="Final answer",
+            reasoning_content="<think>internal reasoning</think>",
+            finish_reason="stop",
+        )
+
+        result = adapter.format_response(response, request)
+
+        assert result.choices[0].message.content == "Final answer"
+        assert result.choices[0].message.reasoning_content == "internal reasoning"
+
+    def test_format_response_extracts_malformed_thinking_from_text(self, adapter):
+        """Malformed raw text should still partition into reasoning and content."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        response = InternalResponse(
+            text="<think>\n<think>reasoning details</think>Final answer",
+            finish_reason="stop",
+        )
+
+        result = adapter.format_response(response, request)
+
+        assert result.choices[0].message.reasoning_content == "reasoning details"
+        assert result.choices[0].message.content == "Final answer"
+
     # =========================================================================
     # format_stream_chunk Tests
     # =========================================================================
@@ -644,6 +677,108 @@ class TestOpenAIAdapter:
         data = json.loads(json_str)
 
         assert data["choices"][0]["delta"]["tool_calls"] == tool_delta
+
+    def test_format_stream_chunk_strips_think_tags_from_standard_fields(self, adapter):
+        """Streaming chunks should never expose raw think markup."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        chunk = StreamChunk(text="<think>reasoning</think>Answer")
+
+        result = adapter.format_stream_chunk(chunk, request)
+
+        json_str = result[6:-2]
+        data = json.loads(json_str)
+        delta = data["choices"][0]["delta"]
+
+        assert delta["reasoning_content"] == "reasoning"
+        assert delta["content"] == "Answer"
+        assert "<think>" not in json.dumps(delta)
+        assert "</think>" not in json.dumps(delta)
+
+    def test_format_stream_chunk_preserves_thinking_state_across_chunks(self, adapter):
+        """Split think tags across chunks should not leak reasoning into content."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+
+        first = adapter.format_stream_chunk(
+            StreamChunk(text="<think>rea", is_first=True),
+            request,
+        )
+        second = adapter.format_stream_chunk(
+            StreamChunk(text="soning</think>Answer", is_last=True),
+            request,
+        )
+
+        first_data = json.loads(first[6:-2])
+        second_data = json.loads(second[6:-2])
+        first_delta = first_data["choices"][0]["delta"]
+        second_delta = second_data["choices"][0]["delta"]
+
+        assert first_delta["reasoning_content"] == "rea"
+        assert "content" not in first_delta
+        assert second_delta["reasoning_content"] == "soning"
+        assert second_delta["content"] == "Answer"
+        assert "<think>" not in json.dumps([first_delta, second_delta])
+        assert "</think>" not in json.dumps([first_delta, second_delta])
+
+    def test_format_stream_chunk_preserves_state_across_equivalent_request_objects(self, adapter):
+        """Equivalent request objects should share stream parsing state."""
+        request1 = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        request2 = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+
+        first = adapter.format_stream_chunk(
+            StreamChunk(text="<think>rea", is_first=True),
+            request1,
+        )
+        second = adapter.format_stream_chunk(
+            StreamChunk(text="soning</think>Answer", is_last=True),
+            request2,
+        )
+
+        first_delta = json.loads(first[6:-2])["choices"][0]["delta"]
+        second_delta = json.loads(second[6:-2])["choices"][0]["delta"]
+
+        assert first_delta["reasoning_content"] == "rea"
+        assert second_delta["reasoning_content"] == "soning"
+        assert second_delta["content"] == "Answer"
+
+    def test_format_stream_end_clears_parser_state_without_last_chunk(self, adapter):
+        """format_stream_end should drop parser state even without an is_last chunk."""
+        request1 = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        request2 = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        request3 = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+
+        adapter.format_stream_chunk(
+            StreamChunk(text="<think>rea", is_first=True),
+            request1,
+        )
+        end_marker = adapter.format_stream_end(request2)
+        resumed = adapter.format_stream_chunk(StreamChunk(text="Answer"), request3)
+
+        resumed_delta = json.loads(resumed[6:-2])["choices"][0]["delta"]
+
+        assert end_marker == "data: [DONE]\n\n"
+        assert resumed_delta["content"] == "Answer"
+        assert "reasoning_content" not in resumed_delta
 
     # =========================================================================
     # format_stream_end Tests

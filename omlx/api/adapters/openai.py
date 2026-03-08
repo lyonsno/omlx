@@ -28,7 +28,7 @@ from ..openai_models import (
     ChatCompletionResponse,
     Usage,
 )
-from ..thinking import extract_thinking
+from ..thinking import ThinkingParser, extract_thinking, strip_think_tags
 from ..utils import clean_special_tokens, extract_text_content
 from ..tool_calling import convert_tools_for_template
 
@@ -40,6 +40,16 @@ class OpenAIAdapter(BaseAdapter):
     Handles conversion between OpenAI chat completion requests/responses
     and the internal format used by the inference engine.
     """
+
+    def __init__(self):
+        # Track parser state per request so raw <think> markup split across
+        # chunks is partitioned consistently throughout the stream.
+        self._thinking_parsers: dict[str, ThinkingParser] = {}
+
+    @staticmethod
+    def _stream_state_key(request: ChatCompletionRequest) -> str:
+        """Build a stable key for a logical stream from request content."""
+        return request.model_dump_json(exclude_none=False)
 
     @property
     def name(self) -> str:
@@ -105,7 +115,11 @@ class OpenAIAdapter(BaseAdapter):
         """
         # Separate thinking from content
         raw_text = clean_special_tokens(response.text) if response.text else ""
-        thinking_content, regular_content = extract_thinking(raw_text)
+        extracted_thinking, regular_content = extract_thinking(raw_text)
+        thinking_content = strip_think_tags(
+            response.reasoning_content or extracted_thinking,
+            trim=True,
+        )
         content = regular_content.strip() if regular_content else None
 
         # Determine finish reason
@@ -120,7 +134,7 @@ class OpenAIAdapter(BaseAdapter):
                 ChatCompletionChoice(
                     message=AssistantMessage(
                         content=content,
-                        reasoning_content=thinking_content if thinking_content else None,
+                        reasoning_content=thinking_content or None,
                         tool_calls=response.tool_calls,
                     ),
                     finish_reason=finish_reason,
@@ -149,10 +163,32 @@ class OpenAIAdapter(BaseAdapter):
             SSE-formatted string.
         """
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        request_key = self._stream_state_key(request)
+
+        content = chunk.text or ""
+        extracted_thinking = ""
+        parser = self._thinking_parsers.get(request_key)
+        if chunk.is_first or parser is None:
+            parser = ThinkingParser()
+            self._thinking_parsers[request_key] = parser
+
+        if content:
+            extracted_thinking, content = parser.feed(content)
+
+        if chunk.is_last:
+            tail_thinking, tail_content = parser.finish()
+            extracted_thinking += tail_thinking
+            content += tail_content
+            self._thinking_parsers.pop(request_key, None)
+
+        reasoning_content = strip_think_tags(
+            chunk.reasoning_content or extracted_thinking,
+            trim=False,
+        )
 
         delta = ChatCompletionChunkDelta(
-            content=chunk.text if chunk.text else None,
-            reasoning_content=chunk.reasoning_content if chunk.reasoning_content else None,
+            content=content if content else None,
+            reasoning_content=reasoning_content or None,
             tool_calls=chunk.tool_call_delta,
         )
 
@@ -191,6 +227,7 @@ class OpenAIAdapter(BaseAdapter):
         Returns:
             SSE-formatted end marker.
         """
+        self._thinking_parsers.pop(self._stream_state_key(request), None)
         return "data: [DONE]\n\n"
 
     def create_error_response(

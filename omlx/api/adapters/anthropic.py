@@ -34,6 +34,8 @@ from ..anthropic_utils import (
     create_text_delta_event,
     map_finish_reason_to_stop_reason,
 )
+from ..thinking import extract_thinking, strip_think_tags
+from ..utils import clean_special_tokens
 
 
 class AnthropicAdapter(BaseAdapter):
@@ -104,13 +106,21 @@ class AnthropicAdapter(BaseAdapter):
         Returns:
             Response dict in Anthropic format.
         """
+        raw_text = clean_special_tokens(response.text) if response.text else ""
+        extracted_thinking, regular_content = extract_thinking(raw_text)
+        thinking_content = strip_think_tags(
+            response.reasoning_content or extracted_thinking,
+            trim=True,
+        )
+
         return convert_internal_to_anthropic_response(
-            text=response.text,
+            text=regular_content,
             finish_reason=response.finish_reason,
             prompt_tokens=response.prompt_tokens,
             completion_tokens=response.completion_tokens,
             model=request.model,
             tool_calls=response.tool_calls,
+            thinking=thinking_content or None,
         )
 
     def format_stream_chunk(

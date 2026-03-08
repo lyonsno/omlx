@@ -164,6 +164,10 @@ class MockEnginePool:
     def get_model_ids(self) -> List[str]:
         return [m["id"] for m in self._models]
 
+    def resolve_model_id(self, model_id: str, settings_manager=None) -> str:
+        """Return requested model id unchanged for test doubles."""
+        return model_id
+
     def get_status(self) -> Dict[str, Any]:
         return {"models": self._models}
 
@@ -603,6 +607,100 @@ class TestStreamingEdgeCases:
         assert response.status_code == 200
         events = parse_sse_events(response.text)
         assert any(e.get("done") for e in events)
+
+    @pytest.mark.slow
+    @pytest.mark.integration
+    def test_streaming_duplicate_think_tags_are_never_exposed(self, client, mock_engine):
+        """Duplicate/misaligned think tags should not leak in SSE deltas."""
+        mock_engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="<think>\n<think>reasoning details</think>Final answer",
+                new_text="<think>\n<think>reasoning details</think>Final answer",
+                finished=True,
+                finish_reason="stop",
+            ),
+        ])
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Explain briefly"}],
+                "stream": True,
+            },
+        )
+
+        assert response.status_code == 200
+        events = parse_sse_events(response.text)
+        non_done_events = [e for e in events if not e.get("done")]
+
+        reasoning_deltas = []
+        content_deltas = []
+
+        for event in non_done_events:
+            if "choices" not in event:
+                continue
+            delta = event["choices"][0].get("delta", {})
+            reasoning = delta.get("reasoning_content")
+            content = delta.get("content")
+            if reasoning:
+                reasoning_deltas.append(reasoning)
+                assert "<think>" not in reasoning
+                assert "</think>" not in reasoning
+            if content:
+                content_deltas.append(content)
+                assert "<think>" not in content
+                assert "</think>" not in content
+
+        assert "".join(reasoning_deltas) == "\nreasoning details"
+        assert "".join(content_deltas) == "Final answer"
+
+    @pytest.mark.slow
+    @pytest.mark.integration
+    def test_streaming_unclosed_think_block_stays_in_reasoning(self, client, mock_engine):
+        """Unclosed think streams should emit reasoning only, without raw tags."""
+        mock_engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="<think>\n<think>partial reasoning that never closes",
+                new_text="<think>\n<think>partial reasoning that never closes",
+                finished=True,
+                finish_reason="stop",
+            ),
+        ])
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Think out loud"}],
+                "stream": True,
+            },
+        )
+
+        assert response.status_code == 200
+        events = parse_sse_events(response.text)
+        non_done_events = [e for e in events if not e.get("done")]
+
+        reasoning_deltas = []
+        content_deltas = []
+
+        for event in non_done_events:
+            if "choices" not in event:
+                continue
+            delta = event["choices"][0].get("delta", {})
+            reasoning = delta.get("reasoning_content")
+            content = delta.get("content")
+            if reasoning:
+                reasoning_deltas.append(reasoning)
+                assert "<think>" not in reasoning
+                assert "</think>" not in reasoning
+            if content:
+                content_deltas.append(content)
+                assert "<think>" not in content
+                assert "</think>" not in content
+
+        assert "".join(reasoning_deltas) == "\npartial reasoning that never closes"
+        assert content_deltas == []
 
     @pytest.mark.slow
     @pytest.mark.integration

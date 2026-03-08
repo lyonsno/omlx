@@ -10,7 +10,7 @@ their chain-of-thought reasoning in <think>...</think> tags.
 """
 
 import re
-from typing import Tuple
+from typing import List, Tuple
 
 
 # Tags used for thinking blocks
@@ -19,11 +19,23 @@ _CLOSE_TAG = "</think>"
 _OPEN_LEN = len(_OPEN_TAG)   # 7
 _CLOSE_LEN = len(_CLOSE_TAG)  # 8
 
-# Regex for non-streaming extraction (complete text)
-_THINKING_PATTERN = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 # Handle case where <think> is missing but </think> is present
 # (scheduler prepends <think>\n but the tag may be split)
 _THINKING_TAIL_PATTERN = re.compile(r'^(.*?)</think>', re.DOTALL)
+
+
+def strip_think_tags(text: str | None, *, trim: bool = True) -> str:
+    """Remove reserved think tag markers from a standard output field.
+
+    Standard assistant-facing fields should expose reasoning as structured data,
+    not raw ``<think>`` / ``</think>`` markup. This helper preserves the payload
+    text while removing the control tags.
+    """
+    if not text:
+        return ""
+
+    cleaned = text.replace(_OPEN_TAG, "").replace(_CLOSE_TAG, "")
+    return cleaned.strip() if trim else cleaned
 
 
 def extract_thinking(text: str) -> Tuple[str, str]:
@@ -45,21 +57,6 @@ def extract_thinking(text: str) -> Tuple[str, str]:
     if not text:
         return ("", "")
 
-    thinking_parts = []
-    remaining = text
-
-    # Extract all <think>...</think> blocks
-    while True:
-        match = _THINKING_PATTERN.search(remaining)
-        if not match:
-            break
-        thinking_parts.append(match.group(1))
-        remaining = remaining[:match.start()] + remaining[match.end():]
-
-    if thinking_parts:
-        thinking = "\n".join(thinking_parts).strip()
-        return (thinking, remaining.strip())
-
     # Handle partial: content before </think> without <think> tag
     if '</think>' in text and '<think>' not in text:
         match = _THINKING_TAIL_PATTERN.match(text)
@@ -68,7 +65,48 @@ def extract_thinking(text: str) -> Tuple[str, str]:
             remaining = text[match.end():].strip()
             return (thinking, remaining)
 
-    return ("", text)
+    # Robust state-machine extraction for malformed/mixed tag streams:
+    # - duplicate opening tags: "<think><think>..."
+    # - extra closing tags: "</think></think>"
+    # - unclosed thinking blocks at end of output
+    thinking_parts: List[str] = []
+    content_parts: List[str] = []
+    current_thinking: List[str] = []
+    in_thinking = False
+    i = 0
+
+    while i < len(text):
+        remaining = text[i:]
+
+        if remaining.startswith(_OPEN_TAG):
+            # Duplicate opens are treated as idempotent.
+            in_thinking = True
+            i += _OPEN_LEN
+            continue
+
+        if remaining.startswith(_CLOSE_TAG):
+            if in_thinking:
+                thinking_parts.append("".join(current_thinking).strip())
+                current_thinking = []
+                in_thinking = False
+            i += _CLOSE_LEN
+            continue
+
+        if in_thinking:
+            current_thinking.append(text[i])
+        else:
+            content_parts.append(text[i])
+        i += 1
+
+    # If stream ends inside thinking, treat the trailing text as thinking.
+    if in_thinking:
+        thinking_parts.append("".join(current_thinking).strip())
+
+    # Keep block boundaries for multi-think outputs while dropping empty blocks.
+    non_empty_thinking = [part for part in thinking_parts if part]
+    thinking = "\n".join(non_empty_thinking).strip()
+    content = "".join(content_parts).strip()
+    return (thinking, content)
 
 
 class ThinkingParser:
