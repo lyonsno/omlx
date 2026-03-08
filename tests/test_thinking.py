@@ -3,7 +3,7 @@
 
 import pytest
 
-from omlx.api.thinking import ThinkingParser, extract_thinking
+from omlx.api.thinking import ThinkingParser, extract_thinking, strip_think_tags
 
 
 class TestExtractThinking:
@@ -79,6 +79,34 @@ class TestExtractThinking:
         )
         assert "Let me reason..." in thinking
         assert "Final answer." in content
+
+    def test_duplicate_open_tag_does_not_leak_into_thinking(self):
+        """Duplicate <think> opens should still return clean thinking/content."""
+        thinking, content = extract_thinking(
+            "<think>\n<think>reasoning details</think>Final answer"
+        )
+        assert thinking == "reasoning details"
+        assert content == "Final answer"
+        assert "<think>" not in thinking
+        assert "</think>" not in content
+
+    def test_duplicate_open_and_close_tags_are_ignored(self):
+        """Extra wrapper tags should be removed from both outputs."""
+        thinking, content = extract_thinking(
+            "<think>\n<think>step by step</think></think>Answer"
+        )
+        assert thinking == "step by step"
+        assert content == "Answer"
+        assert "<think>" not in thinking
+        assert "</think>" not in content
+
+    def test_unclosed_think_block_keeps_text_in_thinking_without_tags(self):
+        """Unclosed blocks should not leak raw tags into visible content."""
+        thinking, content = extract_thinking("<think>\n<think>partial reasoning")
+        assert thinking == "partial reasoning"
+        assert content == ""
+        assert "<think>" not in thinking
+        assert "</think>" not in content
 
 
 class TestThinkingParser:
@@ -260,6 +288,21 @@ class TestCleanSpecialTokens:
             "<|im_start|><think>reasoning</think>Answer<|im_end|>"
         )
         assert "<think>reasoning</think>Answer" == result
+
+
+class TestStripThinkTags:
+    """Tests for stripping reserved think markup from standard fields."""
+
+    def test_none_returns_empty_string(self):
+        assert strip_think_tags(None) == ""
+
+    def test_trim_false_preserves_whitespace(self):
+        result = strip_think_tags("  <think> reasoning </think>  ", trim=False)
+        assert result == "   reasoning   "
+
+    def test_removes_literal_tag_markers_but_keeps_payload(self):
+        result = strip_think_tags("Before <think>tag object</think> after")
+        assert result == "Before tag object after"
 
 
 class TestCleanOutputTextBackwardCompat:

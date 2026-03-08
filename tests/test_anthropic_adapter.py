@@ -343,6 +343,47 @@ class TestAnthropicAdapter:
         # Should still have at least one content block
         assert len(result.content) >= 1
 
+    def test_format_response_separates_thinking_from_text(self, adapter):
+        """Standard text blocks should not contain raw think markup."""
+        request = MessagesRequest(
+            model="claude-3-sonnet",
+            max_tokens=1024,
+            messages=[AnthropicMessage(role="user", content="Hello")],
+        )
+        response = InternalResponse(
+            text="Answer",
+            reasoning_content="<think>internal reasoning</think>",
+            finish_reason="stop",
+        )
+
+        result = adapter.format_response(response, request)
+
+        assert len(result.content) == 2
+        assert result.content[0].type == "thinking"
+        assert result.content[0].thinking == "internal reasoning"
+        assert result.content[1].type == "text"
+        assert result.content[1].text == "Answer"
+
+    def test_format_response_extracts_malformed_thinking_from_text(self, adapter):
+        """Malformed raw text should still become thinking + text blocks."""
+        request = MessagesRequest(
+            model="claude-3-sonnet",
+            max_tokens=1024,
+            messages=[AnthropicMessage(role="user", content="Hello")],
+        )
+        response = InternalResponse(
+            text="<think>\n<think>reasoning details</think>Final answer",
+            finish_reason="stop",
+        )
+
+        result = adapter.format_response(response, request)
+
+        assert len(result.content) == 2
+        assert result.content[0].type == "thinking"
+        assert result.content[0].thinking == "reasoning details"
+        assert result.content[1].type == "text"
+        assert result.content[1].text == "Final answer"
+
     # =========================================================================
     # format_stream_chunk Tests
     # =========================================================================
