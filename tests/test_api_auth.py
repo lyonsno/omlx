@@ -61,6 +61,35 @@ class TestVerifyApiKey:
         finally:
             _server_state.api_key = original_key
 
+    def test_verify_api_key_invalid_key_logs_fingerprints(self, caplog):
+        """Test invalid key logs masked key fingerprints for debugging."""
+        from omlx.server import verify_api_key, _server_state
+        from fastapi import HTTPException
+        from fastapi.security import HTTPAuthorizationCredentials
+        import asyncio
+        import logging
+
+        original_key = _server_state.api_key
+        _server_state.api_key = "correct-key"
+
+        try:
+            credentials = HTTPAuthorizationCredentials(
+                scheme="Bearer",
+                credentials="wrong-key",
+            )
+            with caplog.at_level(logging.WARNING, logger="omlx.server"):
+                with pytest.raises(HTTPException):
+                    asyncio.run(verify_api_key(credentials=credentials))
+
+            message = caplog.text
+            assert "Invalid API key" in message
+            assert "provided_len=" in message
+            assert "expected_len=" in message
+            assert "provided_fp=" in message
+            assert "expected_fp=" in message
+        finally:
+            _server_state.api_key = original_key
+
     def test_verify_api_key_valid_key(self):
         """Test that valid key passes."""
         from omlx.server import verify_api_key, _server_state

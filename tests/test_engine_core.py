@@ -13,6 +13,8 @@ Note: Uses pytest-asyncio for async tests.
 """
 
 import asyncio
+from collections import deque
+from contextlib import suppress
 from unittest.mock import MagicMock, patch, AsyncMock
 
 import pytest
@@ -20,6 +22,64 @@ import pytest
 from omlx.engine_core import EngineCore, AsyncEngineCore, EngineConfig
 from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
 from omlx.scheduler import SchedulerConfig
+
+
+TEST_SYNC_TIMEOUT = 5.0
+
+
+async def _wait_for_thread_event(
+    event,
+    timeout: float = TEST_SYNC_TIMEOUT,
+    message: str = "timed out",
+):
+    """Wait for a threading.Event from async code with a clear assertion message."""
+    fired = await asyncio.to_thread(event.wait, timeout)
+    assert fired, message
+
+
+async def _wait_until(
+    predicate,
+    timeout: float = TEST_SYNC_TIMEOUT,
+    message: str = "condition not met",
+):
+    """Poll an in-memory condition from async code until it becomes true."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    assert predicate(), message
+
+
+def _scheduler_request_fully_cleaned(scheduler, request_id: str) -> bool:
+    """Return True when no scheduler structure still references the request."""
+    return (
+        request_id not in scheduler.requests
+        and all(req.request_id != request_id for req in scheduler.waiting)
+        and request_id not in scheduler.running
+        and request_id not in scheduler.request_id_to_uid
+        and request_id not in scheduler.uid_to_request_id.values()
+    )
+
+
+def _assert_scheduler_request_fully_cleaned(scheduler, request_id: str) -> None:
+    """Assert the same cleanup invariants used by the ghost-request regression tests."""
+    assert request_id not in scheduler.requests
+    assert all(req.request_id != request_id for req in scheduler.waiting)
+    assert request_id not in scheduler.running
+    assert request_id not in scheduler.request_id_to_uid
+    assert request_id not in scheduler.uid_to_request_id.values()
+
+
+def _wait_for_release(
+    event,
+    timeout: float = TEST_SYNC_TIMEOUT,
+    message: str = "release not signaled",
+):
+    """Block a worker-side hook and fail loudly if the test never opened the race window."""
+    released = event.wait(timeout)
+    assert released, message
 
 
 class TestEngineConfig:
@@ -270,19 +330,1330 @@ class TestEngineCoreAddRequest:
 
     @pytest.mark.asyncio
     async def test_add_request_with_default_sampling_params(self, mock_model, mock_tokenizer):
-        """Test add_request() uses default sampling params when none provided."""
+        """add_request() should construct and propagate default SamplingParams()."""
         with patch("omlx.engine_core.get_registry") as mock_registry:
             mock_registry.return_value.acquire.return_value = True
 
             engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            captured_requests = []
+            original_add_request = engine.scheduler.add_request
+
+            def capture_add_request(request):
+                captured_requests.append(request)
+                return original_add_request(request)
+
+            engine.scheduler.add_request = capture_add_request
+
+            try:
+                request_id = await engine.add_request(prompt="Hello")
+
+                assert request_id is not None
+                assert len(captured_requests) == 1
+                assert captured_requests[0].sampling_params == SamplingParams()
+                assert engine.scheduler.requests[request_id].sampling_params == SamplingParams()
+            finally:
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_add_request_cancellation_rolls_back_new_request_tracking(
+        self, mock_model, mock_tokenizer
+    ):
+        """Cancelled add_request() should clear engine-local tracking even if scheduler insertion never happens."""
+        import threading
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            request_id = "cancelled-new-request"
+            entered_add = threading.Event()
+            release_add = threading.Event()
+            finished_add = threading.Event()
+
+            def blocking_add_request(_request):
+                entered_add.set()
+                try:
+                    _wait_for_release(release_add, message="test did not release blocked scheduler.add_request in time")
+                finally:
+                    finished_add.set()
+
+            engine.scheduler.add_request = blocking_add_request
+
+            try:
+                add_task = asyncio.create_task(
+                    engine.add_request(
+                        prompt="Hello",
+                        request_id=request_id,
+                        sampling_params=SamplingParams(max_tokens=8),
+                    )
+                )
+
+                await _wait_for_thread_event(
+                    entered_add,
+                    message="scheduler.add_request did not start in time",
+                )
+
+                add_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await add_task
+
+                assert request_id in engine._pending_adds
+
+                release_add.set()
+                await _wait_for_thread_event(
+                    finished_add,
+                    message="scheduler.add_request worker did not finish in time",
+                )
+                await _wait_until(
+                    lambda: (
+                        request_id not in engine._output_collectors
+                        and request_id not in engine._stream_states
+                        and request_id not in engine._finished_events
+                        and request_id not in engine._pending_adds
+                    ),
+                    message="engine-local tracking cleanup did not finish in time",
+                )
+
+                assert request_id not in engine._output_collectors
+                assert request_id not in engine._stream_states
+                assert request_id not in engine._finished_events
+                assert request_id not in engine._pending_adds
+            finally:
+                release_add.set()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_add_request_cancellation_preserves_existing_request_routing_for_subsequent_engine_loop_dispatch(
+        self, mock_model, mock_tokenizer
+    ):
+        """Cancelled queued duplicate add should leave the live request routable when the engine loop runs later."""
+        import threading
+        from omlx.scheduler import SchedulerOutput
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            request_id = "cancelled-existing-request"
+            original_collector = MagicMock()
+            original_stream_state = object()
+            original_finished_event = asyncio.Event()
+            engine._output_collectors[request_id] = original_collector
+            engine._stream_states[request_id] = original_stream_state
+            engine._finished_events[request_id] = original_finished_event
+            existing_request = Request(
+                request_id=request_id,
+                prompt=[11, 12],
+                sampling_params=SamplingParams(max_tokens=8),
+            )
+            existing_request.prompt_token_ids = [11, 12]
+            existing_request.num_prompt_tokens = 2
+            existing_request.batch_uid = 77
+            existing_request.status = RequestStatus.RUNNING
+            engine.scheduler.requests[request_id] = existing_request
+            engine.scheduler.running[request_id] = existing_request
+            engine.scheduler.request_id_to_uid[request_id] = 77
+            engine.scheduler.uid_to_request_id[77] = request_id
+
+            entered_add = threading.Event()
+            release_add = threading.Event()
+            finished_add = threading.Event()
+            original_add_request = engine.scheduler.add_request
+            step_calls = 0
+
+            def blocking_add_request(request):
+                entered_add.set()
+                try:
+                    _wait_for_release(release_add, message="test did not release blocked scheduler.add_request in time")
+                    return original_add_request(request)
+                finally:
+                    finished_add.set()
+
+            engine.scheduler.add_request = blocking_add_request
+            queued_output = RequestOutput(
+                request_id=request_id,
+                new_text="token",
+                finished=True,
+                completion_tokens=1,
+            )
+
+            def live_request_is_schedulable():
+                return (
+                    engine.scheduler.requests.get(request_id) is existing_request
+                    and engine.scheduler.running.get(request_id) is existing_request
+                    and engine.scheduler.request_id_to_uid.get(request_id) == 77
+                    and engine.scheduler.uid_to_request_id.get(77) == request_id
+                )
+
+            def has_requests():
+                return step_calls == 0 and live_request_is_schedulable()
+
+            def step():
+                nonlocal step_calls
+                assert live_request_is_schedulable(), (
+                    "duplicate add disturbed live scheduler bookkeeping before later dispatch"
+                )
+                step_calls += 1
+                return SchedulerOutput(outputs=[queued_output], has_work=True)
+
+            try:
+                add_task = asyncio.create_task(
+                    engine.add_request(
+                        prompt="Hello",
+                        request_id=request_id,
+                        sampling_params=SamplingParams(max_tokens=8),
+                    )
+                )
+
+                await _wait_for_thread_event(
+                    entered_add,
+                    message="scheduler.add_request did not start in time",
+                )
+                assert not add_task.done(), "duplicate add finished before queued cancellation window"
+
+                current_collector = engine._output_collectors[request_id]
+                current_finished_event = engine._finished_events[request_id]
+                assert current_collector is original_collector
+                assert current_finished_event is original_finished_event
+
+                add_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await add_task
+
+                assert engine._output_collectors[request_id] is original_collector
+                assert engine._stream_states[request_id] is original_stream_state
+                assert engine._finished_events[request_id] is original_finished_event
+
+                release_add.set()
+                await _wait_for_thread_event(
+                    finished_add,
+                    message="scheduler.add_request worker did not finish in time",
+                )
+                await _wait_until(
+                    lambda: (
+                        request_id in engine.scheduler.requests
+                        and request_id not in engine._pending_adds
+                    ),
+                    message="duplicate add cancellation reconciliation did not finish in time",
+                )
+
+                assert engine.scheduler.requests[request_id] is existing_request
+                assert engine.scheduler.running[request_id] is existing_request
+                assert engine.scheduler.request_id_to_uid[request_id] == 77
+                assert engine.scheduler.uid_to_request_id[77] == request_id
+                assert engine._output_collectors[request_id] is original_collector
+                assert engine._stream_states[request_id] is original_stream_state
+                assert engine._finished_events[request_id] is original_finished_event
+                assert request_id not in engine._pending_adds
+
+                engine.scheduler.has_requests = has_requests
+                engine.scheduler.step = step
+                await engine.start()
+                await _wait_until(
+                    lambda: (
+                        original_collector.put.call_count == 1
+                        and original_finished_event.is_set()
+                    ),
+                    message="engine loop did not route output after duplicate cancellation",
+                )
+                delivered_output = original_collector.put.call_args.args[0]
+                assert delivered_output.request_id == request_id
+            finally:
+                release_add.set()
+                if engine.is_running():
+                    await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_add_request_pending_add_guard_rejects_second_fresh_request_id(
+        self, mock_model, mock_tokenizer
+    ):
+        """A second fresh add with the same ID must fail at _pending_adds before scheduler duplicate checks."""
+        import threading
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            request_id = "pending-add-duplicate"
+            entered_add = threading.Event()
+            release_add = threading.Event()
+            finished_add = threading.Event()
+            original_add_request = engine.scheduler.add_request
+            scheduler_call_request_ids = []
+
+            def delayed_add_request(request):
+                scheduler_call_request_ids.append(request.request_id)
+                entered_add.set()
+                try:
+                    _wait_for_release(release_add, message="test did not release blocked scheduler.add_request in time")
+                    return original_add_request(request)
+                finally:
+                    finished_add.set()
+
+            engine.scheduler.add_request = delayed_add_request
+
+            try:
+                first_add_task = asyncio.create_task(
+                    engine.add_request(
+                        prompt=[1, 2, 3],
+                        request_id=request_id,
+                        sampling_params=SamplingParams(max_tokens=8),
+                    )
+                )
+
+                started = await asyncio.to_thread(entered_add.wait, TEST_SYNC_TIMEOUT)
+                assert started, "first scheduler.add_request did not start in time"
+                assert not first_add_task.done(), "first add_request finished before pending-add window"
+                first_collector = engine._output_collectors[request_id]
+                first_stream_state = engine._stream_states[request_id]
+                first_finished_event = engine._finished_events[request_id]
+
+                with pytest.raises(ValueError, match="already exists"):
+                    await engine.add_request(
+                        prompt=[9, 9, 9],
+                        request_id=request_id,
+                        sampling_params=SamplingParams(max_tokens=8),
+                    )
+
+                assert scheduler_call_request_ids == [request_id]
+                assert request_id in engine._pending_adds
+                assert engine._output_collectors[request_id] is first_collector
+                assert engine._stream_states[request_id] is first_stream_state
+                assert engine._finished_events[request_id] is first_finished_event
+
+                release_add.set()
+                completed = await asyncio.to_thread(finished_add.wait, TEST_SYNC_TIMEOUT)
+                assert completed, "first scheduler.add_request worker did not finish in time"
+
+                actual_request_id = await first_add_task
+                assert actual_request_id == request_id
+                assert scheduler_call_request_ids == [request_id]
+                assert engine._output_collectors[request_id] is first_collector
+                assert engine._stream_states[request_id] is first_stream_state
+                assert engine._finished_events[request_id] is first_finished_event
+                assert request_id not in engine._pending_adds
+            finally:
+                release_add.set()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_add_request_cancellation_does_not_leave_late_scheduler_entry(
+        self, mock_model, mock_tokenizer
+    ):
+        """Cancellation should not leave a late scheduler request after executor job completes."""
+        import threading
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            request_id = "cancelled-late-scheduler-entry"
+            entered_add = threading.Event()
+            release_add = threading.Event()
+            finished_add = threading.Event()
+            original_add_request = engine.scheduler.add_request
+
+            def delayed_add_request(request):
+                entered_add.set()
+                _wait_for_release(release_add, message="test did not release blocked scheduler.add_request in time")
+                try:
+                    return original_add_request(request)
+                finally:
+                    finished_add.set()
+
+            engine.scheduler.add_request = delayed_add_request
+
+            try:
+                add_task = asyncio.create_task(
+                    engine.add_request(
+                        prompt=[1, 2, 3],
+                        request_id=request_id,
+                        sampling_params=SamplingParams(max_tokens=8),
+                    )
+                )
+
+                started = await asyncio.to_thread(entered_add.wait, TEST_SYNC_TIMEOUT)
+                assert started, "scheduler.add_request did not start in time"
+
+                add_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await add_task
+
+                release_add.set()
+                completed = await asyncio.to_thread(
+                    finished_add.wait,
+                    TEST_SYNC_TIMEOUT,
+                )
+                assert completed, "scheduler.add_request worker did not finish in time"
+
+                deadline = asyncio.get_running_loop().time() + TEST_SYNC_TIMEOUT
+                while asyncio.get_running_loop().time() < deadline:
+                    if (
+                        _scheduler_request_fully_cleaned(engine.scheduler, request_id)
+                        and request_id not in engine._output_collectors
+                        and request_id not in engine._stream_states
+                        and request_id not in engine._finished_events
+                        and request_id not in engine._pending_adds
+                    ):
+                        break
+                    await asyncio.sleep(0.01)
+
+                _assert_scheduler_request_fully_cleaned(engine.scheduler, request_id)
+                assert request_id not in engine._output_collectors
+                assert request_id not in engine._stream_states
+                assert request_id not in engine._finished_events
+                assert request_id not in engine._pending_adds
+            finally:
+                release_add.set()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_add_request_cancellation_close_immediately_does_not_leave_late_scheduler_entry(
+        self, mock_model, mock_tokenizer
+    ):
+        """Cancellation followed by immediate close should not let a late worker leave scheduler state behind."""
+        import threading
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            request_id = "cancelled-close-race"
+            entered_add = threading.Event()
+            release_add = threading.Event()
+            finished_add = threading.Event()
+            scheduler_ref = engine.scheduler
+            original_add_request = scheduler_ref.add_request
+
+            def delayed_add_request(request):
+                entered_add.set()
+                _wait_for_release(release_add, message="test did not release blocked scheduler.add_request in time")
+                try:
+                    return original_add_request(request)
+                finally:
+                    finished_add.set()
+
+            scheduler_ref.add_request = delayed_add_request
+
+            try:
+                add_task = asyncio.create_task(
+                    engine.add_request(
+                        prompt=[4, 5, 6],
+                        request_id=request_id,
+                        sampling_params=SamplingParams(max_tokens=8),
+                    )
+                )
+
+                started = await asyncio.to_thread(entered_add.wait, TEST_SYNC_TIMEOUT)
+                assert started, "scheduler.add_request did not start in time"
+                assert not add_task.done(), "add_request finished before cancellation/close race"
+
+                add_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await add_task
+
+                assert request_id in engine._pending_adds
+                engine.close()
+                assert request_id not in engine._pending_adds
+
+                release_add.set()
+                completed = await asyncio.to_thread(
+                    finished_add.wait,
+                    TEST_SYNC_TIMEOUT,
+                )
+                assert completed, "scheduler.add_request worker did not finish in time"
+
+                deadline = asyncio.get_running_loop().time() + TEST_SYNC_TIMEOUT
+                while asyncio.get_running_loop().time() < deadline:
+                    if _scheduler_request_fully_cleaned(scheduler_ref, request_id):
+                        break
+                    await asyncio.sleep(0.01)
+
+                _assert_scheduler_request_fully_cleaned(scheduler_ref, request_id)
+            finally:
+                release_add.set()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_add_request_close_during_blocked_add_does_not_repopulate_tracking(
+        self, mock_model, mock_tokenizer
+    ):
+        """Closing during a live blocked add must not let add_request succeed or resurrect routing state."""
+        import threading
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            request_id = "close-during-live-add"
+            entered_add = threading.Event()
+            release_add = threading.Event()
+            finished_add = threading.Event()
+            scheduler_ref = engine.scheduler
+            original_add_request = scheduler_ref.add_request
+
+            def delayed_add_request(request):
+                entered_add.set()
+                _wait_for_release(release_add, message="test did not release blocked scheduler.add_request in time")
+                try:
+                    return original_add_request(request)
+                finally:
+                    finished_add.set()
+
+            scheduler_ref.add_request = delayed_add_request
+
+            try:
+                add_task = asyncio.create_task(
+                    engine.add_request(
+                        prompt=[7, 8, 9],
+                        request_id=request_id,
+                        sampling_params=SamplingParams(max_tokens=8),
+                    )
+                )
+
+                started = await asyncio.to_thread(entered_add.wait, TEST_SYNC_TIMEOUT)
+                assert started, "scheduler.add_request did not start in time"
+                assert not add_task.done(), "add_request finished before close raced it"
+
+                engine.close()
+                assert engine.scheduler is None
+
+                release_add.set()
+                completed = await asyncio.to_thread(
+                    finished_add.wait,
+                    TEST_SYNC_TIMEOUT,
+                )
+                assert completed, "scheduler.add_request worker did not finish in time"
+
+                with pytest.raises(RuntimeError, match="aborted before activation"):
+                    await add_task
+
+                assert engine._output_collectors == {}
+                assert engine._stream_states == {}
+                assert engine._finished_events == {}
+                assert engine._pending_adds == {}
+                _assert_scheduler_request_fully_cleaned(scheduler_ref, request_id)
+            finally:
+                release_add.set()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_add_request_close_during_blocked_duplicate_add_does_not_repopulate_tracking(
+        self, mock_model, mock_tokenizer
+    ):
+        """Closing during a blocked duplicate add must not let the late worker resurrect closed-engine routing."""
+        import threading
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            request_id = "close-during-duplicate-add"
+            existing_request = Request(
+                request_id=request_id,
+                prompt=[11, 12],
+                sampling_params=SamplingParams(max_tokens=8),
+            )
+            existing_request.prompt_token_ids = [11, 12]
+            existing_request.num_prompt_tokens = 2
+            engine.scheduler.requests[request_id] = existing_request
+
+            engine._output_collectors[request_id] = MagicMock()
+            engine._stream_states[request_id] = object()
+            engine._finished_events[request_id] = asyncio.Event()
+
+            entered_add = threading.Event()
+            release_add = threading.Event()
+            finished_add = threading.Event()
+            scheduler_ref = engine.scheduler
+            original_add_request = scheduler_ref.add_request
+
+            def delayed_duplicate_add(request):
+                entered_add.set()
+                _wait_for_release(
+                    release_add,
+                    message="test did not release blocked scheduler.add_request in time",
+                )
+                try:
+                    return original_add_request(request)
+                finally:
+                    finished_add.set()
+
+            scheduler_ref.add_request = delayed_duplicate_add
+
+            try:
+                add_task = asyncio.create_task(
+                    engine.add_request(
+                        prompt=[99],
+                        request_id=request_id,
+                        sampling_params=SamplingParams(max_tokens=8),
+                    )
+                )
+
+                await _wait_for_thread_event(
+                    entered_add,
+                    message="scheduler.add_request did not start in time",
+                )
+                assert not add_task.done(), "duplicate add finished before close raced it"
+
+                engine.close()
+                assert engine.scheduler is None
+
+                release_add.set()
+                await _wait_for_thread_event(
+                    finished_add,
+                    message="scheduler.add_request worker did not finish in time",
+                )
+
+                with pytest.raises(RuntimeError, match="aborted before activation"):
+                    await add_task
+
+                assert engine._output_collectors == {}
+                assert engine._stream_states == {}
+                assert engine._finished_events == {}
+                assert engine._pending_adds == {}
+                _assert_scheduler_request_fully_cleaned(scheduler_ref, request_id)
+            finally:
+                release_add.set()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_stream_outputs_close_during_pending_add_raises_without_hanging(
+        self, mock_model, mock_tokenizer
+    ):
+        """close() during a blocked add should wake waiting stream consumer with a deterministic error."""
+        import threading
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            request_id = "close-pending-add-stream"
+            entered_add = threading.Event()
+            release_add = threading.Event()
+            finished_add = threading.Event()
+            scheduler_ref = engine.scheduler
+            original_add_request = scheduler_ref.add_request
+            stream_task = None
+
+            def delayed_add_request(request):
+                entered_add.set()
+                _wait_for_release(
+                    release_add,
+                    message="test did not release blocked scheduler.add_request in time",
+                )
+                try:
+                    return original_add_request(request)
+                finally:
+                    finished_add.set()
+
+            scheduler_ref.add_request = delayed_add_request
+
+            try:
+                add_task = asyncio.create_task(
+                    engine.add_request(
+                        prompt=[57, 58, 59],
+                        request_id=request_id,
+                        sampling_params=SamplingParams(max_tokens=8),
+                    )
+                )
+
+                await _wait_for_thread_event(
+                    entered_add,
+                    message="scheduler.add_request did not start in time",
+                )
+                assert not add_task.done(), "add_request finished before close raced it"
+
+                collector = engine._output_collectors[request_id]
+                consumer_waiting = asyncio.Event()
+                original_get = collector.get
+
+                async def instrumented_get():
+                    consumer_waiting.set()
+                    return await original_get()
+
+                collector.get = instrumented_get
+
+                async def drain_stream():
+                    with pytest.raises(RuntimeError, match="Request aborted"):
+                        async for _ in engine.stream_outputs(request_id):
+                            pass
+
+                stream_task = asyncio.create_task(drain_stream())
+                await asyncio.wait_for(consumer_waiting.wait(), timeout=TEST_SYNC_TIMEOUT)
+
+                engine.close()
+                assert engine.scheduler is None
+                release_add.set()
+                await _wait_for_thread_event(
+                    finished_add,
+                    message="scheduler.add_request worker did not finish in time",
+                )
+                await _wait_until(
+                    lambda: stream_task.done(),
+                    message="stream_outputs consumer did not unblock after close",
+                )
+                await stream_task
+
+                with pytest.raises(RuntimeError, match="aborted before activation"):
+                    await add_task
+
+                assert engine._output_collectors == {}
+                assert engine._stream_states == {}
+                assert engine._finished_events == {}
+                assert engine._pending_adds == {}
+                _assert_scheduler_request_fully_cleaned(scheduler_ref, request_id)
+            finally:
+                release_add.set()
+                if stream_task is not None and not stream_task.done():
+                    stream_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await stream_task
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_generate_close_during_pending_add_raises_without_hanging(
+        self, mock_model, mock_tokenizer
+    ):
+        """close() during a blocked add should cause generate() to raise promptly."""
+        import threading
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            request_id = "close-pending-add-generate"
+            entered_add = threading.Event()
+            release_add = threading.Event()
+            finished_add = threading.Event()
+            scheduler_ref = engine.scheduler
+            original_add_request = scheduler_ref.add_request
+
+            def delayed_add_request(request):
+                entered_add.set()
+                _wait_for_release(
+                    release_add,
+                    message="test did not release blocked scheduler.add_request in time",
+                )
+                try:
+                    return original_add_request(request)
+                finally:
+                    finished_add.set()
+
+            scheduler_ref.add_request = delayed_add_request
+
+            try:
+                generate_task = asyncio.create_task(
+                    engine.generate(
+                        prompt=[67, 68, 69],
+                        request_id=request_id,
+                        sampling_params=SamplingParams(max_tokens=8),
+                    )
+                )
+
+                await _wait_for_thread_event(
+                    entered_add,
+                    message="scheduler.add_request did not start in time",
+                )
+                assert not generate_task.done(), "generate finished before close raced it"
+
+                engine.close()
+                assert engine.scheduler is None
+
+                release_add.set()
+                await _wait_for_thread_event(
+                    finished_add,
+                    message="scheduler.add_request worker did not finish in time",
+                )
+                await _wait_until(
+                    lambda: generate_task.done(),
+                    message="generate consumer did not unblock after close",
+                )
+                with pytest.raises(RuntimeError, match="aborted before activation"):
+                    await generate_task
+
+                assert engine._output_collectors == {}
+                assert engine._stream_states == {}
+                assert engine._finished_events == {}
+                assert engine._pending_adds == {}
+                _assert_scheduler_request_fully_cleaned(scheduler_ref, request_id)
+            finally:
+                release_add.set()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_add_request_duplicate_id_failure_preserves_routing_for_subsequent_buffered_dispatch(
+        self, mock_model, mock_tokenizer
+    ):
+        """A failed queued duplicate add should leave buffered streaming on the live request intact."""
+        import threading
+        from omlx.engine_core import RequestStreamState
+        from omlx.scheduler import SchedulerOutput
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(
+                model=mock_model,
+                tokenizer=mock_tokenizer,
+                config=EngineConfig(stream_interval=2),
+            )
+
+            request_id = "duplicate-routing-window"
+            existing_request = Request(
+                request_id=request_id,
+                prompt=[11, 12],
+                sampling_params=SamplingParams(max_tokens=8),
+            )
+            existing_request.prompt_token_ids = [11, 12]
+            existing_request.num_prompt_tokens = 2
+            existing_request.batch_uid = 99
+            existing_request.status = RequestStatus.RUNNING
+            engine.scheduler.requests[request_id] = existing_request
+            engine.scheduler.running[request_id] = existing_request
+            engine.scheduler.request_id_to_uid[request_id] = 99
+            engine.scheduler.uid_to_request_id[99] = request_id
+
+            original_collector = MagicMock()
+            original_stream_state = RequestStreamState(stream_interval=2)
+            original_finished_event = asyncio.Event()
+            engine._output_collectors[request_id] = original_collector
+            engine._stream_states[request_id] = original_stream_state
+            engine._finished_events[request_id] = original_finished_event
+
+            entered_add = threading.Event()
+            release_add = threading.Event()
+            original_add_request = engine.scheduler.add_request
+            step_calls = 0
+
+            def delayed_duplicate_add(request):
+                entered_add.set()
+                _wait_for_release(release_add, message="test did not release blocked scheduler.add_request in time")
+                return original_add_request(request)
+
+            engine.scheduler.add_request = delayed_duplicate_add
+            queued_output = RequestOutput(
+                request_id=request_id,
+                new_text="token",
+                finished=True,
+                completion_tokens=1,
+            )
+
+            def live_request_is_schedulable():
+                return (
+                    engine.scheduler.requests.get(request_id) is existing_request
+                    and engine.scheduler.running.get(request_id) is existing_request
+                    and engine.scheduler.request_id_to_uid.get(request_id) == 99
+                    and engine.scheduler.uid_to_request_id.get(99) == request_id
+                )
+
+            def has_requests():
+                return step_calls == 0 and live_request_is_schedulable()
+
+            def step():
+                nonlocal step_calls
+                assert live_request_is_schedulable(), (
+                    "duplicate add disturbed live scheduler bookkeeping before later buffered dispatch"
+                )
+                step_calls += 1
+                return SchedulerOutput(outputs=[queued_output], has_work=True)
+
+            try:
+                add_task = asyncio.create_task(
+                    engine.add_request(
+                        prompt=[99],
+                        request_id=request_id,
+                        sampling_params=SamplingParams(max_tokens=8),
+                    )
+                )
+
+                await _wait_for_thread_event(
+                    entered_add,
+                    message="scheduler.add_request did not start in time",
+                )
+                assert not add_task.done(), "duplicate add finished before queued-routing window"
+
+                current_collector = engine._output_collectors[request_id]
+                current_finished_event = engine._finished_events[request_id]
+                assert current_collector is original_collector
+                assert current_finished_event is original_finished_event
+
+                release_add.set()
+                with pytest.raises(ValueError, match="already exists"):
+                    await add_task
+
+                engine.scheduler.has_requests = has_requests
+                engine.scheduler.step = step
+                await engine.start()
+                await _wait_until(
+                    lambda: (
+                        original_collector.put.call_count == 1
+                        and original_finished_event.is_set()
+                        and original_stream_state.sent_tokens == 1
+                    ),
+                    message="buffered engine loop did not route output after duplicate failure",
+                )
+                assert engine.scheduler.requests[request_id] is existing_request
+                assert engine.scheduler.running[request_id] is existing_request
+                assert engine.scheduler.request_id_to_uid[request_id] == 99
+                assert engine.scheduler.uid_to_request_id[99] == request_id
+                assert engine._output_collectors[request_id] is original_collector
+                assert engine._stream_states[request_id] is original_stream_state
+                assert engine._finished_events[request_id] is original_finished_event
+                assert request_id not in engine._pending_adds
+                original_collector.put.assert_called_once()
+                delivered_output = original_collector.put.call_args.args[0]
+                assert delivered_output.request_id == request_id
+                assert original_finished_event.is_set()
+                assert original_stream_state.sent_tokens == 1
+            finally:
+                release_add.set()
+                if engine.is_running():
+                    await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_add_request_abort_while_executor_add_is_blocked_raises_cleanly(
+        self, mock_model, mock_tokenizer
+    ):
+        """Aborting an in-flight net-new add should not return a dead request ID."""
+        import threading
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            request_id = "abort-during-inflight-add"
+            entered_add = threading.Event()
+            release_add = threading.Event()
+            original_add_request = engine.scheduler.add_request
+
+            def delayed_add_request(request):
+                entered_add.set()
+                _wait_for_release(release_add, message="test did not release blocked scheduler.add_request in time")
+                return original_add_request(request)
+
+            engine.scheduler.add_request = delayed_add_request
+
+            try:
+                add_task = asyncio.create_task(
+                    engine.add_request(
+                        prompt=[1, 2, 3],
+                        request_id=request_id,
+                        sampling_params=SamplingParams(max_tokens=8),
+                    )
+                )
+
+                started = await asyncio.to_thread(entered_add.wait, TEST_SYNC_TIMEOUT)
+                assert started, "scheduler.add_request did not start in time"
+                assert not add_task.done(), "add_request completed before abort_request raced it"
+
+                await engine.abort_request(request_id)
+
+                release_add.set()
+                with pytest.raises(RuntimeError, match="aborted before activation"):
+                    await add_task
+
+                _assert_scheduler_request_fully_cleaned(engine.scheduler, request_id)
+                assert request_id not in engine._output_collectors
+                assert request_id not in engine._stream_states
+                assert request_id not in engine._finished_events
+                assert request_id not in engine._pending_adds
+            finally:
+                release_add.set()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_abort_request_during_pending_add_notifies_stream_outputs_consumer(
+        self, mock_model, mock_tokenizer
+    ):
+        """An attached stream_outputs() consumer should get an abort error, not silently time out."""
+        import threading
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            request_id = "abort-pending-add-stream"
+            entered_add = threading.Event()
+            release_add = threading.Event()
+            original_add_request = engine.scheduler.add_request
+            stream_task = None
+
+            def delayed_add_request(request):
+                entered_add.set()
+                _wait_for_release(
+                    release_add,
+                    message="test did not release blocked scheduler.add_request in time",
+                )
+                return original_add_request(request)
+
+            engine.scheduler.add_request = delayed_add_request
+
+            try:
+                add_task = asyncio.create_task(
+                    engine.add_request(
+                        prompt=[21, 22, 23],
+                        request_id=request_id,
+                        sampling_params=SamplingParams(max_tokens=8),
+                    )
+                )
+
+                await _wait_for_thread_event(
+                    entered_add,
+                    message="scheduler.add_request did not start in time",
+                )
+                assert not add_task.done(), "add_request completed before abort_request raced it"
+
+                collector = engine._output_collectors[request_id]
+                consumer_waiting = asyncio.Event()
+                original_get = collector.get
+
+                async def instrumented_get():
+                    consumer_waiting.set()
+                    return await original_get()
+
+                collector.get = instrumented_get
+                seen_outputs = []
+
+                async def drain_stream():
+                    with pytest.raises(RuntimeError, match="Request aborted"):
+                        async for output in engine.stream_outputs(request_id):
+                            seen_outputs.append(output)
+
+                stream_task = asyncio.create_task(drain_stream())
+                await asyncio.wait_for(consumer_waiting.wait(), timeout=TEST_SYNC_TIMEOUT)
+
+                await engine.abort_request(request_id)
+                await asyncio.wait_for(stream_task, timeout=TEST_SYNC_TIMEOUT)
+                assert not add_task.done(), "stream_outputs only unblocked after pending add completed"
+
+                release_add.set()
+                with pytest.raises(RuntimeError, match="aborted before activation"):
+                    await add_task
+
+                assert seen_outputs
+                assert seen_outputs[-1].request_id == request_id
+                assert seen_outputs[-1].finished is True
+                assert seen_outputs[-1].error == "Request aborted"
+                assert request_id not in engine._output_collectors
+                assert request_id not in engine._stream_states
+                assert request_id not in engine._finished_events
+                assert request_id not in engine._pending_adds
+            finally:
+                release_add.set()
+                if stream_task is not None and not stream_task.done():
+                    stream_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await stream_task
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_add_failure_does_not_restore_tracking_after_abort(
+        self, mock_model, mock_tokenizer
+    ):
+        """Duplicate add should not resurrect routing state removed by abort_request()."""
+        import threading
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            request_id = "duplicate-abort-race"
+            existing_request = Request(
+                request_id=request_id,
+                prompt=[11, 12],
+                sampling_params=SamplingParams(max_tokens=8),
+            )
+            existing_request.prompt_token_ids = [11, 12]
+            existing_request.num_prompt_tokens = 2
+            engine.scheduler.requests[request_id] = existing_request
+
+            original_collector = MagicMock()
+            original_stream_state = object()
+            original_finished_event = asyncio.Event()
+            engine._output_collectors[request_id] = original_collector
+            engine._stream_states[request_id] = original_stream_state
+            engine._finished_events[request_id] = original_finished_event
+
+            entered_add = threading.Event()
+            release_add = threading.Event()
+            original_add_request = engine.scheduler.add_request
+
+            def delayed_duplicate_add(request):
+                entered_add.set()
+                _wait_for_release(release_add, message="test did not release blocked scheduler.add_request in time")
+                return original_add_request(request)
+
+            engine.scheduler.add_request = delayed_duplicate_add
+
+            try:
+                add_task = asyncio.create_task(
+                    engine.add_request(
+                        prompt=[99],
+                        request_id=request_id,
+                        sampling_params=SamplingParams(max_tokens=8),
+                    )
+                )
+
+                started = await asyncio.to_thread(entered_add.wait, TEST_SYNC_TIMEOUT)
+                assert started, "scheduler.add_request did not start in time"
+                assert not add_task.done(), "duplicate add finished before abort_request raced it"
+
+                await engine.abort_request(request_id)
+                assert request_id not in engine._output_collectors
+                assert request_id not in engine._stream_states
+                assert request_id not in engine._finished_events
+
+                release_add.set()
+                with pytest.raises(ValueError, match="already exists"):
+                    await add_task
+
+                assert request_id not in engine._output_collectors
+                assert request_id not in engine._stream_states
+                assert request_id not in engine._finished_events
+                assert request_id not in engine._pending_adds
+            finally:
+                release_add.set()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_add_request_scheduler_failure_rolls_back_tracking_state(
+        self, mock_model, mock_tokenizer
+    ):
+        """Reachable duplicate-ID failure should preserve live routing and scheduler bookkeeping."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            request_id = "existing-request"
+            existing_collector = MagicMock()
+            existing_stream_state = object()
+            existing_event = asyncio.Event()
+            existing_scheduler_request = Request(
+                request_id=request_id,
+                prompt=[4, 5],
+                sampling_params=SamplingParams(max_tokens=8),
+            )
+            existing_scheduler_request.prompt_token_ids = [4, 5]
+            existing_scheduler_request.num_prompt_tokens = 2
+            existing_scheduler_request.batch_uid = 41
+            existing_scheduler_request.status = RequestStatus.RUNNING
+            engine._output_collectors[request_id] = existing_collector
+            engine._stream_states[request_id] = existing_stream_state
+            engine._finished_events[request_id] = existing_event
+            engine.scheduler.requests[request_id] = existing_scheduler_request
+            engine.scheduler.running[request_id] = existing_scheduler_request
+            engine.scheduler.request_id_to_uid[request_id] = 41
+            engine.scheduler.uid_to_request_id[41] = request_id
+
+            try:
+                with pytest.raises(ValueError, match="already exists"):
+                    await engine.add_request(
+                        prompt=[1, 2, 3],
+                        request_id=request_id,
+                        sampling_params=SamplingParams(max_tokens=8),
+                    )
+
+                assert engine.scheduler.requests[request_id] is existing_scheduler_request
+                assert all(req.request_id != request_id for req in engine.scheduler.waiting)
+                assert engine.scheduler.running[request_id] is existing_scheduler_request
+                assert engine.scheduler.request_id_to_uid[request_id] == 41
+                assert engine.scheduler.uid_to_request_id[41] == request_id
+                assert engine._output_collectors[request_id] is existing_collector
+                assert engine._stream_states[request_id] is existing_stream_state
+                assert engine._finished_events[request_id] is existing_event
+                assert request_id not in engine._pending_adds
+            finally:
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_add_request_scheduler_failure_rolls_back_new_request_tracking(
+        self, mock_model, mock_tokenizer
+    ):
+        """Reachable tokenizer failure should remove new engine tracking without leaving scheduler ghosts."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            request_id = "fresh-request-failure"
+
+            try:
+                with patch.object(
+                    mock_tokenizer,
+                    "encode",
+                    side_effect=RuntimeError("tokenizer boom"),
+                ):
+                    with pytest.raises(RuntimeError, match="tokenizer boom"):
+                        await engine.add_request(
+                            prompt="Hello",
+                            request_id=request_id,
+                            sampling_params=SamplingParams(max_tokens=8),
+                        )
+
+                _assert_scheduler_request_fully_cleaned(engine.scheduler, request_id)
+                assert request_id not in engine._output_collectors
+                assert request_id not in engine._stream_states
+                assert request_id not in engine._finished_events
+                assert request_id not in engine._pending_adds
+            finally:
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_add_request_mixed_rewind_serializes_with_running_step(
+        self, mock_model, mock_tokenizer
+    ):
+        """Mixed-cache exact-hit rewind must serialize with step() on the MLX executor."""
+        import threading
+        import time
+
+        from omlx.cache.paged_cache import BlockTable
+        from omlx.scheduler import SchedulerOutput
+
+        class KVCache:
+            def __init__(self, offset=4):
+                self.offset = offset
+
+            def can_rewind(self, n):
+                return n <= self.offset
+
+            def rewind(self, n):
+                if not self.can_rewind(n):
+                    return False
+                self.offset -= n
+                return True
+
+        class RotatingKVCache:
+            def __init__(self, offset=4):
+                self.offset = offset
+
+            def can_rewind(self, n):
+                return n <= self.offset
+
+            def rewind(self, n):
+                if not self.can_rewind(n):
+                    return False
+                self.offset -= n
+                return True
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            active_count = 0
+            max_concurrent = 0
+            step_calls = 0
+            lock = threading.Lock()
+            step_started = threading.Event()
+            step_release = threading.Event()
+            rewind_started = threading.Event()
+            step_thread_ids = []
+            rewind_thread_ids = []
+
+            def _enter_critical():
+                nonlocal active_count, max_concurrent
+                with lock:
+                    active_count += 1
+                    max_concurrent = max(max_concurrent, active_count)
+
+            def _exit_critical():
+                nonlocal active_count
+                with lock:
+                    active_count -= 1
+
+            def tracked_step():
+                nonlocal step_calls
+                _enter_critical()
+                try:
+                    step_thread_ids.append(threading.get_ident())
+                    step_started.set()
+                    _wait_for_release(step_release, message="test did not release blocked scheduler.step in time")
+                    time.sleep(0.01)
+                    step_calls += 1
+                    return SchedulerOutput(outputs=[])
+                finally:
+                    _exit_critical()
+
+            def has_requests():
+                return step_calls == 0
+
+            original_rewind = engine.scheduler._rewind_prompt_cache_for_generation
+
+            def tracked_rewind(cache_list):
+                _enter_critical()
+                try:
+                    rewind_started.set()
+                    rewind_thread_ids.append(threading.get_ident())
+                    return original_rewind(cache_list)
+                finally:
+                    _exit_critical()
+
+            engine.scheduler.step = tracked_step
+            engine.scheduler.has_requests = has_requests
+            engine.scheduler._rewind_prompt_cache_for_generation = tracked_rewind
+            engine.scheduler.block_aware_cache = MagicMock()
+            engine.scheduler.paged_cache_manager = MagicMock()
+            engine.scheduler.paged_cache_manager.release_for_eviction.return_value = 0
+            engine.scheduler.paged_cache_manager.get_block_table.return_value = None
+
+            block_table = BlockTable(
+                request_id="req-engine-mixed-rewind-threading",
+                block_ids=[1],
+                num_tokens=4,
+            )
+            engine.scheduler.block_aware_cache.fetch_cache.return_value = (block_table, [])
+            engine.scheduler.block_aware_cache.reconstruct_cache.return_value = [
+                KVCache(offset=4),
+                RotatingKVCache(offset=4),
+            ]
+
+            request_id = "req-engine-mixed-rewind-threading"
+            loop_thread_id = threading.get_ident()
 
             try:
                 await engine.start()
 
-                request_id = await engine.add_request(prompt="Hello")
+                started = await asyncio.to_thread(step_started.wait, TEST_SYNC_TIMEOUT)
+                assert started, "engine loop did not start a step() in time"
 
-                # Should not raise - default params used
-                assert request_id is not None
+                add_task = asyncio.create_task(
+                    engine.add_request(
+                        prompt=[31, 32, 33, 34],
+                        sampling_params=SamplingParams(max_tokens=8),
+                        request_id=request_id,
+                    )
+                )
+                deadline = asyncio.get_running_loop().time() + TEST_SYNC_TIMEOUT
+                while (
+                    request_id not in engine._pending_adds
+                    and asyncio.get_running_loop().time() < deadline
+                ):
+                    await asyncio.sleep(0)
+                assert request_id in engine._pending_adds
+                assert not rewind_started.is_set(), "rewind started before step() released the executor"
+                step_release.set()
+                rewind_started_in_time = await asyncio.to_thread(
+                    rewind_started.wait,
+                    TEST_SYNC_TIMEOUT,
+                )
+                assert rewind_started_in_time, "rewind did not start after step() released the executor"
+                actual_request_id = await add_task
+
+                assert actual_request_id == request_id
+                assert step_thread_ids, "engine loop did not invoke step()"
+                assert rewind_thread_ids, "mixed exact-hit path did not invoke rewind"
+                assert all(
+                    tid != loop_thread_id for tid in rewind_thread_ids
+                ), "rewind executed on the event-loop thread"
+                assert all(
+                    tid == step_thread_ids[0] for tid in rewind_thread_ids
+                ), "rewind did not execute on the shared MLX executor thread"
+                assert max_concurrent == 1, (
+                    "rewind overlapped with step(); mixed-cache rewind is not serialized "
+                    "on the shared MLX executor"
+                )
+                engine.scheduler.paged_cache_manager.delete_block_table.assert_not_called()
+                assert request_id not in engine._pending_adds
             finally:
                 await engine.stop()
                 engine.close()
@@ -501,6 +1872,119 @@ class TestEngineCoreGenerateCancellation:
                 assert request_id not in engine._finished_events
             finally:
                 await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_generate_abort_request_during_pending_add_raises_cleanly(
+        self, mock_model, mock_tokenizer
+    ):
+        """generate() should fail promptly if abort_request() retires a blocked add before activation."""
+        import threading
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            request_id = "generate-abort-pending-add"
+            entered_add = threading.Event()
+            release_add = threading.Event()
+            original_add_request = engine.scheduler.add_request
+
+            def delayed_add_request(request):
+                entered_add.set()
+                _wait_for_release(
+                    release_add,
+                    message="test did not release blocked scheduler.add_request in time",
+                )
+                return original_add_request(request)
+
+            engine.scheduler.add_request = delayed_add_request
+
+            try:
+                task = asyncio.create_task(
+                    engine.generate(
+                        prompt=[41, 42, 43],
+                        request_id=request_id,
+                        sampling_params=SamplingParams(max_tokens=8),
+                    )
+                )
+
+                await _wait_for_thread_event(
+                    entered_add,
+                    message="scheduler.add_request did not start in time",
+                )
+                assert not task.done(), "generate() finished before abort_request raced it"
+
+                await engine.abort_request(request_id)
+
+                release_add.set()
+                with pytest.raises(RuntimeError, match="aborted before activation"):
+                    await asyncio.wait_for(task, timeout=TEST_SYNC_TIMEOUT)
+
+                assert request_id not in engine._output_collectors
+                assert request_id not in engine._stream_states
+                assert request_id not in engine._finished_events
+                assert request_id not in engine._pending_adds
+                _assert_scheduler_request_fully_cleaned(engine.scheduler, request_id)
+            finally:
+                release_add.set()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_generate_abort_all_requests_during_pending_add_raises_cleanly(
+        self, mock_model, mock_tokenizer
+    ):
+        """generate() should fail promptly if abort_all_requests() retires a blocked add before activation."""
+        import threading
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            request_id = "generate-abort-all-pending-add"
+            entered_add = threading.Event()
+            release_add = threading.Event()
+            original_add_request = engine.scheduler.add_request
+
+            def delayed_add_request(request):
+                entered_add.set()
+                _wait_for_release(
+                    release_add,
+                    message="test did not release blocked scheduler.add_request in time",
+                )
+                return original_add_request(request)
+
+            engine.scheduler.add_request = delayed_add_request
+
+            try:
+                task = asyncio.create_task(
+                    engine.generate(
+                        prompt=[51, 52, 53],
+                        request_id=request_id,
+                        sampling_params=SamplingParams(max_tokens=8),
+                    )
+                )
+
+                await _wait_for_thread_event(
+                    entered_add,
+                    message="scheduler.add_request did not start in time",
+                )
+                assert not task.done(), "generate() finished before abort_all_requests raced it"
+
+                count = await engine.abort_all_requests()
+                assert count == 1
+
+                release_add.set()
+                with pytest.raises(RuntimeError, match="aborted before activation"):
+                    await asyncio.wait_for(task, timeout=TEST_SYNC_TIMEOUT)
+
+                assert request_id not in engine._output_collectors
+                assert request_id not in engine._stream_states
+                assert request_id not in engine._finished_events
+                assert request_id not in engine._pending_adds
+                _assert_scheduler_request_fully_cleaned(engine.scheduler, request_id)
+            finally:
+                release_add.set()
                 engine.close()
 
     @pytest.mark.asyncio
@@ -841,3 +2325,357 @@ class TestEngineCoreAbortAllRequests:
             finally:
                 await engine.stop()
                 engine.close()
+
+    @pytest.mark.asyncio
+    async def test_abort_all_requests_while_duplicate_add_pending_keeps_live_request_routing(
+        self, mock_model, mock_tokenizer
+    ):
+        """abort_all_requests() should target the live request routing even while a duplicate add is pending."""
+        import threading
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            request_id = "abort-all-duplicate-pending"
+            existing_request = Request(
+                request_id=request_id,
+                prompt=[11, 12],
+                sampling_params=SamplingParams(max_tokens=8),
+            )
+            existing_request.prompt_token_ids = [11, 12]
+            existing_request.num_prompt_tokens = 2
+            engine.scheduler.requests[request_id] = existing_request
+
+            original_collector = MagicMock()
+            original_stream_state = object()
+            original_finished_event = asyncio.Event()
+            engine._output_collectors[request_id] = original_collector
+            engine._stream_states[request_id] = original_stream_state
+            engine._finished_events[request_id] = original_finished_event
+
+            entered_add = threading.Event()
+            release_add = threading.Event()
+            original_add_request = engine.scheduler.add_request
+
+            def delayed_duplicate_add(request):
+                entered_add.set()
+                _wait_for_release(release_add, message="test did not release blocked scheduler.add_request in time")
+                return original_add_request(request)
+
+            engine.scheduler.add_request = delayed_duplicate_add
+
+            try:
+                add_task = asyncio.create_task(
+                    engine.add_request(
+                        prompt=[99],
+                        request_id=request_id,
+                        sampling_params=SamplingParams(max_tokens=8),
+                    )
+                )
+
+                await _wait_for_thread_event(
+                    entered_add,
+                    message="scheduler.add_request did not start in time",
+                )
+                assert not add_task.done(), "duplicate add finished before abort_all_requests raced it"
+
+                count = await engine.abort_all_requests()
+                assert count == 1
+
+                original_collector.put.assert_called_once()
+                abort_output = original_collector.put.call_args.args[0]
+                assert abort_output.request_id == request_id
+                assert abort_output.finished is True
+                assert abort_output.finish_reason == "error"
+                assert original_finished_event.is_set()
+                assert engine._output_collectors[request_id] is original_collector
+                assert engine._stream_states[request_id] is original_stream_state
+                assert engine._finished_events[request_id] is original_finished_event
+                assert request_id in engine.scheduler._pending_abort_ids
+
+                release_add.set()
+                with pytest.raises(ValueError, match="already exists"):
+                    await add_task
+
+                engine.scheduler._process_pending_aborts()
+                _assert_scheduler_request_fully_cleaned(engine.scheduler, request_id)
+                assert engine._output_collectors[request_id] is original_collector
+                assert engine._stream_states[request_id] is original_stream_state
+                assert engine._finished_events[request_id] is original_finished_event
+                assert request_id not in engine._pending_adds
+            finally:
+                release_add.set()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_abort_all_requests_during_inflight_add_raises_after_stream_cleanup(
+        self, mock_model, mock_tokenizer
+    ):
+        """Abort-all plus stream cleanup should not let add_request succeed afterward."""
+        import threading
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            request_id = "abort-all-inflight-add"
+            entered_add = threading.Event()
+            release_add = threading.Event()
+            original_add_request = engine.scheduler.add_request
+
+            def delayed_add_request(request):
+                entered_add.set()
+                _wait_for_release(release_add, message="test did not release blocked scheduler.add_request in time")
+                return original_add_request(request)
+
+            async def drain_stream():
+                with pytest.raises(RuntimeError, match="Request aborted"):
+                    async for _ in engine.stream_outputs(request_id):
+                        pass
+
+            engine.scheduler.add_request = delayed_add_request
+
+            try:
+                add_task = asyncio.create_task(
+                    engine.add_request(
+                        prompt=[7, 8, 9],
+                        request_id=request_id,
+                        sampling_params=SamplingParams(max_tokens=8),
+                    )
+                )
+
+                started = await asyncio.to_thread(entered_add.wait, TEST_SYNC_TIMEOUT)
+                assert started, "scheduler.add_request did not start in time"
+                assert not add_task.done(), "add_request completed before abort_all_requests raced it"
+
+                collector = engine._output_collectors[request_id]
+                consumer_waiting = asyncio.Event()
+                original_get = collector.get
+
+                async def instrumented_get():
+                    consumer_waiting.set()
+                    return await original_get()
+
+                collector.get = instrumented_get
+                stream_task = asyncio.create_task(drain_stream())
+                await asyncio.wait_for(consumer_waiting.wait(), timeout=TEST_SYNC_TIMEOUT)
+
+                count = await engine.abort_all_requests()
+                assert count == 1
+
+                await stream_task
+                assert not add_task.done(), "add_request finished before post-stream-cleanup window"
+                assert request_id in engine._pending_adds
+
+                release_add.set()
+                with pytest.raises(RuntimeError, match="aborted before activation"):
+                    await add_task
+
+                _assert_scheduler_request_fully_cleaned(engine.scheduler, request_id)
+                assert request_id not in engine._output_collectors
+                assert request_id not in engine._stream_states
+                assert request_id not in engine._finished_events
+                assert request_id not in engine._pending_adds
+            finally:
+                release_add.set()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_abort_all_requests_during_inflight_add_without_consumer_raises_cleanly(
+        self, mock_model, mock_tokenizer
+    ):
+        """Abort-all should retire an in-flight net-new add even without consumer cleanup."""
+        import threading
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            request_id = "abort-all-inflight-no-consumer"
+            entered_add = threading.Event()
+            release_add = threading.Event()
+            original_add_request = engine.scheduler.add_request
+
+            def delayed_add_request(request):
+                entered_add.set()
+                _wait_for_release(release_add, message="test did not release blocked scheduler.add_request in time")
+                return original_add_request(request)
+
+            engine.scheduler.add_request = delayed_add_request
+
+            try:
+                add_task = asyncio.create_task(
+                    engine.add_request(
+                        prompt=[17, 18, 19],
+                        request_id=request_id,
+                        sampling_params=SamplingParams(max_tokens=8),
+                    )
+                )
+
+                started = await asyncio.to_thread(entered_add.wait, TEST_SYNC_TIMEOUT)
+                assert started, "scheduler.add_request did not start in time"
+                assert not add_task.done(), "add_request completed before abort_all_requests raced it"
+
+                count = await engine.abort_all_requests()
+                assert count == 1
+
+                release_add.set()
+                with pytest.raises(RuntimeError, match="aborted before activation"):
+                    await add_task
+
+                _assert_scheduler_request_fully_cleaned(engine.scheduler, request_id)
+                assert request_id not in engine._output_collectors
+                assert request_id not in engine._stream_states
+                assert request_id not in engine._finished_events
+                assert request_id not in engine._pending_adds
+            finally:
+                release_add.set()
+                engine.close()
+
+
+class TestGlobalMLXExecutor:
+    """Tests for the global MLX executor singleton (issue #85)."""
+
+    def test_get_mlx_executor_returns_singleton(self):
+        """get_mlx_executor() must always return the same executor instance."""
+        from omlx.engine_core import get_mlx_executor
+
+        executor1 = get_mlx_executor()
+        executor2 = get_mlx_executor()
+        assert executor1 is executor2
+
+    def test_engines_share_mlx_executor(self, mock_model, mock_tokenizer):
+        """Multiple EngineCore instances must share a single MLX executor (#85)."""
+        from omlx.engine_core import get_mlx_executor
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine1 = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            engine2 = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                assert engine1._mlx_executor is engine2._mlx_executor
+                assert engine1._mlx_executor is get_mlx_executor()
+            finally:
+                engine1.close()
+                engine2.close()
+
+    @pytest.mark.asyncio
+    async def test_shared_executor_serializes_concurrent_tasks(self):
+        """Concurrent submissions to shared executor must never overlap (#85).
+
+        Simulates two engines submitting work simultaneously and verifies
+        that tasks run one at a time (no concurrent execution).
+        """
+        import threading
+        import time
+        from omlx.engine_core import get_mlx_executor
+
+        executor = get_mlx_executor()
+        loop = asyncio.get_running_loop()
+
+        active_count = 0
+        max_concurrent = 0
+        lock = threading.Lock()
+
+        def simulated_step(task_id: str, duration: float = 0.05):
+            """Simulate a scheduler.step() that takes some time."""
+            nonlocal active_count, max_concurrent
+            with lock:
+                active_count += 1
+                if active_count > max_concurrent:
+                    max_concurrent = active_count
+            time.sleep(duration)
+            with lock:
+                active_count -= 1
+            return task_id
+
+        # Submit multiple tasks concurrently (simulating two engines)
+        tasks = [
+            loop.run_in_executor(executor, simulated_step, "engine_a_step1"),
+            loop.run_in_executor(executor, simulated_step, "engine_b_step1"),
+            loop.run_in_executor(executor, simulated_step, "engine_a_step2"),
+            loop.run_in_executor(executor, simulated_step, "engine_b_step2"),
+        ]
+        results = await asyncio.gather(*tasks)
+
+        # All tasks completed
+        assert set(results) == {
+            "engine_a_step1", "engine_b_step1",
+            "engine_a_step2", "engine_b_step2",
+        }
+        # Critical: no two tasks ever ran at the same time
+        assert max_concurrent == 1, (
+            f"Expected max 1 concurrent task, got {max_concurrent}. "
+            f"Shared executor failed to serialize MLX operations."
+        )
+
+    @pytest.mark.asyncio
+    async def test_two_engine_loops_serialize_on_shared_executor(
+        self, mock_model, mock_tokenizer
+    ):
+        """Two engines running their loops must serialize step() calls (#85).
+
+        Creates two EngineCore instances with mock schedulers, starts both
+        engine loops, and verifies their scheduler.step() calls never overlap.
+        """
+        import threading
+        import time
+
+        active_count = 0
+        max_concurrent = 0
+        total_steps = 0
+        lock = threading.Lock()
+
+        def make_tracked_step():
+            """Create a step function that tracks concurrency."""
+            from omlx.scheduler import SchedulerOutput
+
+            def tracked_step():
+                nonlocal active_count, max_concurrent, total_steps
+                with lock:
+                    active_count += 1
+                    total_steps += 1
+                    if active_count > max_concurrent:
+                        max_concurrent = active_count
+                time.sleep(0.01)  # Simulate GPU work
+                with lock:
+                    active_count -= 1
+                return SchedulerOutput(outputs=[])
+
+            return tracked_step
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine1 = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            engine2 = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            # Wire up tracked step functions
+            engine1.scheduler.step = make_tracked_step()
+            engine2.scheduler.step = make_tracked_step()
+            engine1.scheduler.has_requests = lambda: True
+            engine2.scheduler.has_requests = lambda: True
+
+            try:
+                await engine1.start()
+                await engine2.start()
+
+                # Let both engines run for a bit
+                await asyncio.sleep(0.3)
+            finally:
+                await engine1.stop()
+                await engine2.stop()
+                engine1.close()
+                engine2.close()
+
+        assert total_steps >= 4, (
+            f"Expected at least 4 steps from two engines, got {total_steps}"
+        )
+        assert max_concurrent == 1, (
+            f"Expected max 1 concurrent step(), got {max_concurrent}. "
+            f"Two engines ran MLX operations in parallel — would cause "
+            f"Metal command buffer races in production."
+        )

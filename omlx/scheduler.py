@@ -824,7 +824,6 @@ class SchedulerConfig:
     # Scheduling policy
     policy: SchedulingPolicy = SchedulingPolicy.FCFS
     # BatchGenerator settings (passed directly to mlx-lm)
-    prefill_batch_size: int = 8
     completion_batch_size: int = 32
     prefill_step_size: int = 2048
 
@@ -924,6 +923,8 @@ class Scheduler:
     The key insight is that mlx-lm's BatchGenerator already implements
     continuous batching at the token level, so we use it as the backend.
     """
+
+    _UNCLONEABLE_REWIND_SNAPSHOT = object()
 
     def __init__(
         self,
@@ -1431,7 +1432,7 @@ class Scheduler:
             stop_tokens=stop_tokens,
             sampler=sampler,
             logits_processors=logits_processors if logits_processors else None,
-            prefill_batch_size=self.config.prefill_batch_size,
+            prefill_batch_size=1,
             completion_batch_size=self.config.completion_batch_size,
             prefill_step_size=self.config.prefill_step_size,
             boundary_block_size=self.config.paged_cache_block_size,
@@ -1478,59 +1479,79 @@ class Scheduler:
             sampling_params.repetition_penalty,
         )
 
-    def _cache_tree_has_stateful_non_sliceable(self, cache_obj: Any) -> bool:
-        """Detect non-sliceable recurrent cache layers requiring snapshots."""
+    def _classify_cache_tree_sliceability(self, cache_obj: Any) -> Tuple[bool, bool]:
+        """Classify cache tree into (has_sliceable, has_stateful_non_sliceable)."""
         # None placeholders from boundary snapshots (sliceable layers replaced).
         if cache_obj is None:
-            return False
+            return False, False
 
         # CacheList nests multiple cache objects.
         sub_caches = getattr(cache_obj, "caches", None)
         if isinstance(sub_caches, (list, tuple)):
-            return any(
-                self._cache_tree_has_stateful_non_sliceable(sub_cache)
-                for sub_cache in sub_caches
-            )
+            has_sliceable = False
+            has_stateful_non_sliceable = False
+            for sub_cache in sub_caches:
+                sub_has_sliceable, sub_has_stateful = (
+                    self._classify_cache_tree_sliceability(sub_cache)
+                )
+                has_sliceable = has_sliceable or sub_has_sliceable
+                has_stateful_non_sliceable = (
+                    has_stateful_non_sliceable or sub_has_stateful
+                )
+            return has_sliceable, has_stateful_non_sliceable
 
         class_name = type(cache_obj).__name__
 
-        # Known sliceable cache types — no boundary snapshots needed.
+        # Known sliceable cache types.
         if class_name in (
             "KVCache",
             "BatchKVCache",
             "QuantizedKVCache",
         ):
-            return False
+            return True, False
 
-        # Stateful non-sliceable caches require boundary-safe snapshots.
+        # Known stateful non-sliceable caches.
         if class_name in (
             "RotatingKVCache",
             "BatchRotatingKVCache",
             "ArraysCache",
             "SizedArraysCache",
         ):
-            return True
-
-        if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
-            handler = CacheTypeRegistry.get_handler_by_class_name(class_name)
-            if not handler.supports_block_slicing:
-                return True
+            return False, True
 
         # Best-effort fallback for unknown recurrent cache structures.
         state_list = getattr(cache_obj, "cache", None)
-        if isinstance(state_list, list):
-            return True
+        unknown_stateful_fallback = isinstance(state_list, list)
 
-        return False
+        if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
+            # Fail closed for unregistered cache classes in mixed-rewind gating.
+            class_name_map = getattr(CacheTypeRegistry, "_class_name_map", {})
+            if class_name != "SizedArraysCache" and class_name not in class_name_map:
+                return False, unknown_stateful_fallback
+            handler = CacheTypeRegistry.get_handler_by_class_name(class_name)
+            supports_block_slicing = bool(handler.supports_block_slicing)
+            if supports_block_slicing:
+                return True, False
+            return False, True
+
+        return False, unknown_stateful_fallback
+
+    def _cache_tree_has_stateful_non_sliceable(self, cache_obj: Any) -> bool:
+        """Detect non-sliceable recurrent cache layers requiring snapshots."""
+        _, has_stateful_non_sliceable = self._classify_cache_tree_sliceability(cache_obj)
+        return has_stateful_non_sliceable
 
     def _cache_list_needs_boundary_snapshot(self, cache_list: List[Any]) -> bool:
         """Return True if any layer cache requires boundary snapshots."""
         if not cache_list:
             return False
-        return any(
-            self._cache_tree_has_stateful_non_sliceable(layer_cache)
-            for layer_cache in cache_list
-        )
+        for layer_cache in cache_list:
+            _, has_stateful_non_sliceable = self._classify_cache_tree_sliceability(
+                layer_cache
+            )
+            if has_stateful_non_sliceable:
+                return True
+        return False
 
     def _on_prefill_boundary_snapshot(
         self,
@@ -2194,21 +2215,34 @@ class Scheduler:
                     # shifts the model state and can change greedy output.
                     if len(request.remaining_tokens) == 0 and request.cached_tokens > 0:
                         if self._cache_list_needs_boundary_snapshot(request.prompt_cache):
-                            # Stateful non-sliceable caches (Rotating/Arrays)
-                            # cannot be safely converted from N to N-1 state
-                            # without cache-type-specific logic.
-                            if self.paged_cache_manager is not None:
-                                self.paged_cache_manager.delete_block_table(request.request_id)
-                            request.prompt_cache = None
-                            request.block_table = None
-                            request.cached_tokens = 0
-                            request.shared_prefix_blocks = 0
-                            request.remaining_tokens = request.prompt_token_ids
-                            logger.debug(
-                                f"Request {request.request_id}: exact cache hit with "
-                                f"stateful cache type, falling back to full prefill "
-                                f"for deterministic kickoff"
-                            )
+                            if (
+                                self._cache_list_has_mixed_sliceability(request.prompt_cache)
+                                and self._rewind_prompt_cache_for_generation(request.prompt_cache)
+                            ):
+                                request.cached_tokens = max(0, request.cached_tokens - 1)
+                                request.remaining_tokens = request.prompt_token_ids[-1:]
+                                logger.debug(
+                                    f"Request {request.request_id}: exact mixed-cache hit adjusted "
+                                    f"to N-1 state via rewind for generation kickoff "
+                                    f"(cached_tokens={request.cached_tokens}, "
+                                    f"remaining={len(request.remaining_tokens)})"
+                                )
+                            else:
+                                # Stateful non-sliceable caches remain fail-closed
+                                # unless mixed sliceable+stateful layers can be
+                                # safely rewound by one token.
+                                if self.paged_cache_manager is not None:
+                                    self.paged_cache_manager.delete_block_table(request.request_id)
+                                request.prompt_cache = None
+                                request.block_table = None
+                                request.cached_tokens = 0
+                                request.shared_prefix_blocks = 0
+                                request.remaining_tokens = request.prompt_token_ids
+                                logger.debug(
+                                    f"Request {request.request_id}: exact cache hit with "
+                                    f"stateful cache type could not rewind safely, "
+                                    f"falling back to full prefill for deterministic kickoff"
+                                )
                         elif self._trim_prompt_cache_for_generation(request.prompt_cache):
                             request.cached_tokens = max(0, request.cached_tokens - 1)
                             request.remaining_tokens = request.prompt_token_ids[-1:]
@@ -2277,6 +2311,641 @@ class Scheduler:
         for cache_obj in cache_list:
             if not self._trim_cache_tree_by_one(cache_obj):
                 return False
+        return True
+
+    def _cache_tree_has_sliceable_layer(self, cache_obj: Any) -> bool:
+        """Return True if cache tree contains any sliceable layer."""
+        has_sliceable, _ = self._classify_cache_tree_sliceability(cache_obj)
+        return has_sliceable
+
+    def _cache_tree_has_unregistered_class(self, cache_obj: Any) -> bool:
+        """Return True when cache tree contains an unregistered/unknown class."""
+        if cache_obj is None:
+            return False
+
+        class_name = type(cache_obj).__name__
+        known_names = {
+            "KVCache",
+            "BatchKVCache",
+            "QuantizedKVCache",
+            "RotatingKVCache",
+            "BatchRotatingKVCache",
+            "ArraysCache",
+            "SizedArraysCache",
+            "CacheList",
+        }
+
+        if class_name not in known_names:
+            if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
+                class_name_map = getattr(CacheTypeRegistry, "_class_name_map", {})
+                if class_name not in class_name_map:
+                    return True
+            else:
+                return True
+
+        sub_caches = getattr(cache_obj, "caches", None)
+        if isinstance(sub_caches, (list, tuple)):
+            return any(
+                self._cache_tree_has_unregistered_class(sub_cache)
+                for sub_cache in sub_caches
+            )
+
+        return False
+
+    def _cache_list_has_mixed_sliceability(self, cache_list: List[Any]) -> bool:
+        """Return True when cache list includes sliceable and stateful layers."""
+        if not cache_list:
+            return False
+
+        # Fail closed: any unknown class in the tree disables mixed rewind.
+        if any(self._cache_tree_has_unregistered_class(cache_obj) for cache_obj in cache_list):
+            return False
+
+        has_sliceable = False
+        has_stateful_non_sliceable = False
+        for cache_obj in cache_list:
+            sub_has_sliceable, sub_has_stateful = self._classify_cache_tree_sliceability(
+                cache_obj
+            )
+            has_sliceable = has_sliceable or sub_has_sliceable
+            has_stateful_non_sliceable = has_stateful_non_sliceable or sub_has_stateful
+            if has_sliceable and has_stateful_non_sliceable:
+                return True
+        return False
+
+    def _can_rewind_cache_tree_by_one(self, cache_obj: Any) -> bool:
+        """Preflight check: can this cache object rewind one token safely?"""
+        sub_caches = getattr(cache_obj, "caches", None)
+        if isinstance(sub_caches, (list, tuple)):
+            return all(self._can_rewind_cache_tree_by_one(sub_cache) for sub_cache in sub_caches)
+
+        can_rewind_fn = getattr(cache_obj, "can_rewind", None)
+        if callable(can_rewind_fn):
+            try:
+                return bool(can_rewind_fn(1))
+            except Exception:
+                return False
+
+        # Compatibility fallback for trim-only and rewind-only cache APIs.
+        trim_fn = getattr(cache_obj, "trim", None)
+        rewind_fn = getattr(cache_obj, "rewind", None)
+        has_trim = callable(trim_fn)
+        has_rewind = callable(rewind_fn)
+        if not has_trim and not has_rewind:
+            return False
+
+        def _coerce_scalar_token_count(value: Any) -> Optional[int]:
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float):
+                if value.is_integer():
+                    return int(value)
+                return None
+            item_fn = getattr(value, "item", None)
+            if callable(item_fn):
+                try:
+                    item_value = item_fn()
+                    if isinstance(item_value, bool):
+                        return None
+                    if isinstance(item_value, int):
+                        return item_value
+                    if isinstance(item_value, float) and item_value.is_integer():
+                        return int(item_value)
+                except Exception:
+                    pass
+            wrapped_value = getattr(value, "value", None)
+            if isinstance(wrapped_value, bool):
+                return None
+            if isinstance(wrapped_value, int):
+                return wrapped_value
+            if isinstance(wrapped_value, float) and wrapped_value.is_integer():
+                return int(wrapped_value)
+            return None
+
+        # Saturated rotating windows may report is_trimmable=False while trim(1)
+        # still succeeds. Prefer explicit token counters over is_trimmable().
+        for attr_name in ("offset", "_offset"):
+            token_count = _coerce_scalar_token_count(getattr(cache_obj, attr_name, None))
+            if token_count is not None:
+                return token_count >= 1
+
+        size_fn = getattr(cache_obj, "size", None)
+        try:
+            if callable(size_fn):
+                size_value = _coerce_scalar_token_count(size_fn())
+                if size_value is not None and size_value >= 1:
+                    return True
+        except Exception:
+            return False
+
+        # Last-resort capability signal for trim-only caches that do not expose
+        # counters but still advertise trimmability.
+        is_trimmable_fn = getattr(cache_obj, "is_trimmable", None)
+        if has_trim and callable(is_trimmable_fn):
+            try:
+                return bool(is_trimmable_fn())
+            except Exception:
+                return False
+
+        # Rewind-only implementations may not expose can_rewind/trim/is_trimmable
+        # but are still handled by mutation path via rewind(1).
+        if has_rewind:
+            return True
+
+        return False
+
+    def _rewind_cache_tree_by_one(self, cache_obj: Any) -> bool:
+        """Mutate cache object by rewinding one token."""
+        sub_caches = getattr(cache_obj, "caches", None)
+        if isinstance(sub_caches, (list, tuple)):
+            return all(self._rewind_cache_tree_by_one(sub_cache) for sub_cache in sub_caches)
+
+        rewind_fn = getattr(cache_obj, "rewind", None)
+        if callable(rewind_fn):
+            try:
+                return bool(rewind_fn(1))
+            except Exception:
+                return False
+
+        # Compatibility fallback for trim-only cache implementations.
+        trim_fn = getattr(cache_obj, "trim", None)
+        if not callable(trim_fn):
+            return False
+        try:
+            trimmed = trim_fn(1)
+            if trimmed is None:
+                return True
+            return int(trimmed) >= 1
+        except Exception:
+            return False
+
+    @staticmethod
+    def _clone_rewind_snapshot_value(
+        value: Any,
+        active_ids: Optional[Set[int]] = None,
+        memo: Optional[Dict[int, Any]] = None,
+    ) -> Any:
+        """Clone rollback payload values.
+
+        Fail closed for cyclic/uncloneable structures while preserving
+        tensor-like references and shared-reference aliasing.
+        """
+        uncloneable = Scheduler._UNCLONEABLE_REWIND_SNAPSHOT
+        if active_ids is None:
+            active_ids = set()
+        if memo is None:
+            memo = {}
+        if value is None or isinstance(value, (str, bytes, int, float, bool, complex)):
+            return value
+        # Avoid deep-copying tensor-like payloads; rewind rollback only needs
+        # metadata-pointer safety for current mlx-lm cache tensors.
+        if hasattr(value, "shape") and hasattr(value, "dtype") and hasattr(value, "nbytes"):
+            return value
+
+        value_id = id(value)
+        if value_id in active_ids:
+            return uncloneable
+        if value_id in memo:
+            return memo[value_id]
+        active_ids.add(value_id)
+        try:
+            if isinstance(value, dict):
+                cloned_dict = {}
+                memo[value_id] = cloned_dict
+                for key, item in value.items():
+                    cloned_key = Scheduler._clone_rewind_snapshot_value(
+                        key,
+                        active_ids,
+                        memo,
+                    )
+                    if cloned_key is uncloneable:
+                        return uncloneable
+                    cloned_item = Scheduler._clone_rewind_snapshot_value(
+                        item,
+                        active_ids,
+                        memo,
+                    )
+                    if cloned_item is uncloneable:
+                        return uncloneable
+                    cloned_dict[cloned_key] = cloned_item
+                return cloned_dict
+            if isinstance(value, list):
+                cloned_list = []
+                memo[value_id] = cloned_list
+                for item in value:
+                    cloned_item = Scheduler._clone_rewind_snapshot_value(
+                        item,
+                        active_ids,
+                        memo,
+                    )
+                    if cloned_item is uncloneable:
+                        return uncloneable
+                    cloned_list.append(cloned_item)
+                return cloned_list
+            if isinstance(value, tuple):
+                cloned_tuple = []
+                for item in value:
+                    cloned_item = Scheduler._clone_rewind_snapshot_value(
+                        item,
+                        active_ids,
+                        memo,
+                    )
+                    if cloned_item is uncloneable:
+                        return uncloneable
+                    cloned_tuple.append(cloned_item)
+                frozen_tuple = tuple(cloned_tuple)
+                memo[value_id] = frozen_tuple
+                return frozen_tuple
+            if isinstance(value, set):
+                cloned_set = set()
+                memo[value_id] = cloned_set
+                for item in value:
+                    cloned_item = Scheduler._clone_rewind_snapshot_value(
+                        item,
+                        active_ids,
+                        memo,
+                    )
+                    if cloned_item is uncloneable:
+                        return uncloneable
+                    try:
+                        cloned_set.add(cloned_item)
+                    except Exception:
+                        return uncloneable
+                return cloned_set
+            try:
+                cloned_value = copy.deepcopy(value, memo)
+                memo[value_id] = cloned_value
+                return cloned_value
+            except Exception:
+                pass
+
+            # Best-effort clone for custom mutable objects that reject deepcopy.
+            # This restores transactional rollback for simple state payload classes.
+            value_type = type(value)
+            try:
+                clone = value_type.__new__(value_type)
+            except Exception:
+                return uncloneable
+            memo[value_id] = clone
+
+            value_dict = getattr(value, "__dict__", None)
+            if isinstance(value_dict, dict):
+                for attr_name, attr_value in value_dict.items():
+                    cloned_attr = Scheduler._clone_rewind_snapshot_value(
+                        attr_value,
+                        active_ids,
+                        memo,
+                    )
+                    if cloned_attr is uncloneable:
+                        return uncloneable
+                    try:
+                        setattr(clone, attr_name, cloned_attr)
+                    except Exception:
+                        return uncloneable
+                return clone
+
+            slots = getattr(value_type, "__slots__", ())
+            if isinstance(slots, str):
+                slots = (slots,)
+            if isinstance(slots, (list, tuple)):
+                for slot_name in slots:
+                    if slot_name == "__weakref__":
+                        continue
+                    if not hasattr(value, slot_name):
+                        continue
+                    cloned_attr = Scheduler._clone_rewind_snapshot_value(
+                        getattr(value, slot_name),
+                        active_ids,
+                        memo,
+                    )
+                    if cloned_attr is uncloneable:
+                        return uncloneable
+                    try:
+                        setattr(clone, slot_name, cloned_attr)
+                    except Exception:
+                        return uncloneable
+                return clone
+
+            return uncloneable
+        finally:
+            active_ids.discard(value_id)
+
+    @staticmethod
+    def _is_invalid_rewind_snapshot(snapshot: Any) -> bool:
+        return (
+            isinstance(snapshot, tuple)
+            and len(snapshot) == 2
+            and snapshot[0] == "invalid"
+        )
+
+    @staticmethod
+    def _rewind_snapshot_has_cycle(
+        value: Any,
+        visiting: Optional[Set[int]] = None,
+        seen: Optional[Set[int]] = None,
+    ) -> bool:
+        """Detect object-graph cycles in rollback snapshot payloads."""
+        if value is None or isinstance(value, (str, bytes, int, float, bool, complex)):
+            return False
+        if hasattr(value, "shape") and hasattr(value, "dtype") and hasattr(value, "nbytes"):
+            return False
+
+        if visiting is None:
+            visiting = set()
+        if seen is None:
+            seen = set()
+
+        value_id = id(value)
+        if value_id in visiting:
+            return True
+        if value_id in seen:
+            return False
+
+        visiting.add(value_id)
+        try:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if Scheduler._rewind_snapshot_has_cycle(key, visiting, seen):
+                        return True
+                    if Scheduler._rewind_snapshot_has_cycle(item, visiting, seen):
+                        return True
+                return False
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    if Scheduler._rewind_snapshot_has_cycle(item, visiting, seen):
+                        return True
+                return False
+
+            value_dict = getattr(value, "__dict__", None)
+            if isinstance(value_dict, dict):
+                for attr_value in value_dict.values():
+                    if Scheduler._rewind_snapshot_has_cycle(attr_value, visiting, seen):
+                        return True
+                return False
+
+            value_type = type(value)
+            slots = getattr(value_type, "__slots__", ())
+            if isinstance(slots, str):
+                slots = (slots,)
+            if isinstance(slots, (list, tuple)):
+                for slot_name in slots:
+                    if slot_name == "__weakref__":
+                        continue
+                    if not hasattr(value, slot_name):
+                        continue
+                    if Scheduler._rewind_snapshot_has_cycle(
+                        getattr(value, slot_name),
+                        visiting,
+                        seen,
+                    ):
+                        return True
+            return False
+        finally:
+            visiting.discard(value_id)
+            seen.add(value_id)
+
+    def _snapshot_cache_tree_rewind_metadata(
+        self,
+        cache_obj: Any,
+        clone_memo: Optional[Dict[int, Any]] = None,
+    ) -> Any:
+        """Capture lightweight metadata needed to restore one-token rewind mutations."""
+        uncloneable = self._UNCLONEABLE_REWIND_SNAPSHOT
+        attr_missing = object()
+        if clone_memo is None:
+            clone_memo = {}
+        sub_caches = getattr(cache_obj, "caches", None)
+        if isinstance(sub_caches, (list, tuple)):
+            sub_snapshots = [
+                self._snapshot_cache_tree_rewind_metadata(
+                    sub_cache,
+                    clone_memo=clone_memo,
+                )
+                for sub_cache in sub_caches
+            ]
+            if any(self._is_invalid_rewind_snapshot(snapshot) for snapshot in sub_snapshots):
+                return ("invalid", None)
+            return ("tree", sub_snapshots)
+
+        snapshot: Dict[str, Any] = {}
+        # Capture generic payload state first; this is cheap for current mlx-lm
+        # caches (mostly references) and protects future rewind implementations
+        # that may mutate additional per-layer payload.
+        try:
+            state_value = getattr(cache_obj, "state", attr_missing)
+        except Exception:
+            return ("invalid", None)
+        if state_value is not attr_missing:
+            if self._rewind_snapshot_has_cycle(state_value):
+                return ("invalid", None)
+            cloned_state = self._clone_rewind_snapshot_value(
+                state_value,
+                memo=clone_memo,
+            )
+            if cloned_state is uncloneable:
+                return ("invalid", None)
+            snapshot["state"] = cloned_state
+
+        try:
+            meta_state_value = getattr(cache_obj, "meta_state", attr_missing)
+        except Exception:
+            return ("invalid", None)
+        if meta_state_value is not attr_missing:
+            if self._rewind_snapshot_has_cycle(meta_state_value):
+                return ("invalid", None)
+            cloned_meta_state = self._clone_rewind_snapshot_value(
+                meta_state_value,
+                memo=clone_memo,
+            )
+            if cloned_meta_state is uncloneable:
+                return ("invalid", None)
+            snapshot["meta_state"] = cloned_meta_state
+
+        for attr_name in ("keys", "values", "cache"):
+            try:
+                attr_value = getattr(cache_obj, attr_name, attr_missing)
+            except Exception:
+                return ("invalid", None)
+            if attr_value is attr_missing:
+                continue
+            if self._rewind_snapshot_has_cycle(attr_value):
+                return ("invalid", None)
+            cloned_attr = self._clone_rewind_snapshot_value(
+                attr_value,
+                memo=clone_memo,
+            )
+            if cloned_attr is uncloneable:
+                return ("invalid", None)
+            snapshot[attr_name] = cloned_attr
+
+        for attr_name in ("offset", "_offset", "_idx", "start_position", "rotated"):
+            try:
+                snapshot[attr_name] = copy.deepcopy(getattr(cache_obj, attr_name))
+            except Exception:
+                continue
+
+        return ("leaf", snapshot)
+
+    def _restore_cache_tree_rewind_metadata(
+        self,
+        cache_obj: Any,
+        snapshot: Any,
+        restore_memo: Optional[Dict[int, Any]] = None,
+        state_owners: Optional[Dict[int, List[Any]]] = None,
+    ) -> None:
+        """Best-effort rollback for metadata snapshots captured before rewind."""
+        if not isinstance(snapshot, tuple) or len(snapshot) != 2:
+            return
+
+        if restore_memo is None:
+            restore_memo = {}
+        if state_owners is None:
+            state_owners = {}
+
+        snapshot_kind, payload = snapshot
+        if snapshot_kind == "invalid":
+            return
+        if snapshot_kind == "tree":
+            sub_caches = getattr(cache_obj, "caches", None)
+            if not isinstance(sub_caches, (list, tuple)) or not isinstance(payload, list):
+                return
+            for sub_cache, sub_snapshot in zip(sub_caches, payload):
+                self._restore_cache_tree_rewind_metadata(
+                    sub_cache,
+                    sub_snapshot,
+                    restore_memo=restore_memo,
+                    state_owners=state_owners,
+                )
+            return
+
+        if snapshot_kind != "leaf" or not isinstance(payload, dict):
+            return
+
+        state_restored = False
+        state_assignment_failed = False
+        state_snapshot_id = id(payload["state"]) if "state" in payload else None
+        state_backup = None
+        if state_snapshot_id is not None and state_snapshot_id in restore_memo:
+            state_backup = self._clone_rewind_snapshot_value(
+                restore_memo[state_snapshot_id],
+                memo={},
+            )
+            if state_backup is self._UNCLONEABLE_REWIND_SNAPSHOT:
+                state_backup = None
+        if "state" in payload:
+            try:
+                cloned_state = self._clone_rewind_snapshot_value(
+                    payload["state"],
+                    memo=restore_memo,
+                )
+                if cloned_state is self._UNCLONEABLE_REWIND_SNAPSHOT:
+                    raise ValueError("state snapshot is uncloneable")
+                setattr(
+                    cache_obj,
+                    "state",
+                    cloned_state,
+                )
+                state_restored = True
+                if state_snapshot_id is not None:
+                    owners = state_owners.setdefault(state_snapshot_id, [])
+                    if cache_obj not in owners:
+                        owners.append(cache_obj)
+            except Exception:
+                state_assignment_failed = True
+                if state_snapshot_id is not None and state_backup is not None:
+                    restore_memo[state_snapshot_id] = state_backup
+                    for owner in state_owners.get(state_snapshot_id, []):
+                        try:
+                            setattr(owner, "state", state_backup)
+                        except Exception:
+                            pass
+
+        if state_restored:
+            payload_restore_memo = restore_memo
+        else:
+            # Do not reuse memoized state clones when state assignment failed;
+            # state setters may mutate assigned payloads before raising.
+            payload_restore_memo = {} if state_assignment_failed else restore_memo
+
+        if "meta_state" in payload:
+            try:
+                cloned_meta_state = self._clone_rewind_snapshot_value(
+                    payload["meta_state"],
+                    memo=payload_restore_memo,
+                )
+                if cloned_meta_state is self._UNCLONEABLE_REWIND_SNAPSHOT:
+                    raise ValueError("meta_state snapshot is uncloneable")
+                setattr(cache_obj, "meta_state", cloned_meta_state)
+            except Exception:
+                pass
+
+        for attr_name in ("offset", "_offset", "_idx", "start_position", "rotated"):
+            if attr_name not in payload:
+                continue
+            try:
+                setattr(cache_obj, attr_name, copy.deepcopy(payload[attr_name]))
+            except Exception:
+                continue
+
+        payload_attr_memo: Dict[int, Any]
+        if state_restored:
+            payload_attr_memo = restore_memo
+        else:
+            # If state assignment failed, isolate payload restoration from any
+            # possibly mutated state clone objects.
+            payload_attr_memo = {} if state_assignment_failed else restore_memo
+
+        for attr_name in ("keys", "values", "cache"):
+            if attr_name not in payload:
+                continue
+            try:
+                cloned_attr = self._clone_rewind_snapshot_value(
+                    payload[attr_name],
+                    memo=payload_attr_memo,
+                )
+                if cloned_attr is self._UNCLONEABLE_REWIND_SNAPSHOT:
+                    continue
+                setattr(
+                    cache_obj,
+                    attr_name,
+                    cloned_attr,
+                )
+            except Exception:
+                continue
+
+    def _rewind_prompt_cache_for_generation(self, cache_list: List[Any]) -> bool:
+        """Rewind each cache layer by one token with fail-closed preflight."""
+        if not cache_list:
+            return False
+
+        if not all(self._can_rewind_cache_tree_by_one(cache_obj) for cache_obj in cache_list):
+            return False
+
+        snapshot_clone_memo: Dict[int, Any] = {}
+        rewind_snapshots = [
+            self._snapshot_cache_tree_rewind_metadata(
+                cache_obj,
+                clone_memo=snapshot_clone_memo,
+            )
+            for cache_obj in cache_list
+        ]
+        if any(self._is_invalid_rewind_snapshot(snapshot) for snapshot in rewind_snapshots):
+            return False
+        for cache_obj in cache_list:
+            if self._rewind_cache_tree_by_one(cache_obj):
+                continue
+            rollback_restore_memo: Dict[int, Any] = {}
+            rollback_state_owners: Dict[int, List[Any]] = {}
+            for rollback_cache, snapshot in zip(cache_list, rewind_snapshots):
+                self._restore_cache_tree_rewind_metadata(
+                    rollback_cache,
+                    snapshot,
+                    restore_memo=rollback_restore_memo,
+                    state_owners=rollback_state_owners,
+                )
+            return False
         return True
 
     def _trim_cache_tree_by_one(self, cache_obj: Any) -> bool:
@@ -2850,7 +3519,7 @@ class Scheduler:
         # can conflict with async Metal operations on the generation stream.
         # This is needed even when active_batch is None, because _next() sets
         # active_batch = None after mx.async_eval when all requests finish.
-        if finished_ids and self.block_aware_cache is not None:
+        if finished_ids:
             mx.synchronize(generation_stream)
 
         for request_id in finished_ids:
@@ -2972,9 +3641,11 @@ class Scheduler:
             # Clean up Harmony parser
             self._cleanup_harmony_parser(request_id)
 
-            # Clean up VLM adapter state (position_ids, rope_deltas)
+            # Clean up VLM adapter state (position_ids, rope_deltas, pending embeddings)
             if hasattr(self.model, 'clear_vlm_position_state'):
                 self.model.clear_vlm_position_state()
+            if hasattr(self.model, 'clear_pending_embeddings'):
+                self.model.clear_pending_embeddings()
 
             # Drop any boundary snapshot for this request.
             self._boundary_cache_snapshots.pop(request_id, None)

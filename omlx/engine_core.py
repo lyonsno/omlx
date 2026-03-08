@@ -17,7 +17,7 @@ import concurrent.futures
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, List, Optional, Set, Union
 
 import mlx.core as mx
@@ -25,7 +25,7 @@ import mlx.core as mx
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig, SchedulerOutput
 from .output_collector import RequestOutputCollector, RequestStreamState
-from .model_registry import get_registry, ModelOwnershipError
+from .model_registry import get_registry
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,17 @@ class EngineConfig:
     scheduler_config: Optional[SchedulerConfig] = None
     step_interval: float = 0.001  # 1ms between steps
     stream_interval: int = 1  # Tokens to batch before streaming (1=every token)
+
+
+@dataclass
+class _PendingAddState:
+    """Tracks routing ownership while scheduler.add_request runs on the executor."""
+
+    new_collector: RequestOutputCollector
+    new_stream_state: RequestStreamState
+    new_finished_event: asyncio.Event
+    had_existing_tracking: bool
+    externally_retired: bool = False
 
 
 class EngineCore:
@@ -97,6 +108,7 @@ class EngineCore:
         self._output_collectors: Dict[str, RequestOutputCollector] = {}
         self._stream_states: Dict[str, RequestStreamState] = {}
         self._finished_events: Dict[str, asyncio.Event] = {}
+        self._pending_adds: Dict[str, _PendingAddState] = {}
 
         # Engine state
         self._running = False
@@ -270,6 +282,9 @@ class EngineCore:
         if sampling_params is None:
             sampling_params = SamplingParams()
 
+        if request_id in self._pending_adds:
+            raise ValueError(f"Request {request_id} already exists")
+
         request = Request(
             request_id=request_id,
             prompt=prompt,
@@ -281,15 +296,111 @@ class EngineCore:
             vlm_image_hash=vlm_image_hash,
         )
 
-        # Setup output collector with stream_interval from config
-        self._output_collectors[request_id] = RequestOutputCollector(aggregate=True)
-        self._stream_states[request_id] = RequestStreamState(
+        had_existing_tracking = (
+            request_id in self._output_collectors
+            or request_id in self._stream_states
+            or request_id in self._finished_events
+        )
+
+        new_collector = RequestOutputCollector(aggregate=True)
+        new_stream_state = RequestStreamState(
             stream_interval=self.config.stream_interval
         )
-        self._finished_events[request_id] = asyncio.Event()
+        new_finished_event = asyncio.Event()
+        pending_add = _PendingAddState(
+            new_collector=new_collector,
+            new_stream_state=new_stream_state,
+            new_finished_event=new_finished_event,
+            had_existing_tracking=had_existing_tracking,
+        )
+        self._pending_adds[request_id] = pending_add
 
-        # Add to scheduler
-        self.scheduler.add_request(request)
+        def _install_tracking_state() -> None:
+            self._output_collectors[request_id] = new_collector
+            self._stream_states[request_id] = new_stream_state
+            self._finished_events[request_id] = new_finished_event
+
+        def _remove_new_tracking_state() -> None:
+            collector = self._output_collectors.get(request_id)
+            if collector is new_collector:
+                self._output_collectors.pop(request_id, None)
+                new_collector.clear()
+
+            if self._stream_states.get(request_id) is new_stream_state:
+                self._stream_states.pop(request_id, None)
+
+            if self._finished_events.get(request_id) is new_finished_event:
+                self._finished_events.pop(request_id, None)
+
+        def _clear_pending_add_state() -> None:
+            if self._pending_adds.get(request_id) is pending_add:
+                self._pending_adds.pop(request_id, None)
+
+        loop = asyncio.get_running_loop()
+        scheduler = self.scheduler
+        # Install routing eagerly for new IDs, but do not disturb live routing
+        # for duplicate-ID attempts until the scheduler accepts the request.
+        if not had_existing_tracking:
+            _install_tracking_state()
+
+        add_future = loop.run_in_executor(
+            self._mlx_executor,
+            scheduler.add_request,
+            request,
+        )
+
+        async def _finalize_cancelled_add() -> None:
+            """Clean up executor-side add_request work after caller cancellation."""
+            try:
+                try:
+                    await add_future
+                except Exception:
+                    return
+
+                # Late success after cancellation: abort on the MLX executor so
+                # scheduler state and engine routing stay in sync.
+                await loop.run_in_executor(
+                    self._mlx_executor,
+                    scheduler._do_abort_request,
+                    request_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to finalize cancelled add_request for request %s",
+                    request_id,
+                )
+            finally:
+                if not pending_add.had_existing_tracking:
+                    _remove_new_tracking_state()
+                _clear_pending_add_state()
+
+        try:
+            await asyncio.shield(add_future)
+        except asyncio.CancelledError:
+            loop.create_task(_finalize_cancelled_add())
+            raise
+        except Exception:
+            if not pending_add.had_existing_tracking:
+                _remove_new_tracking_state()
+            _clear_pending_add_state()
+            raise
+
+        if pending_add.externally_retired:
+            try:
+                await loop.run_in_executor(
+                    self._mlx_executor,
+                    scheduler._do_abort_request,
+                    request_id,
+                )
+            finally:
+                if not pending_add.had_existing_tracking:
+                    _remove_new_tracking_state()
+                _clear_pending_add_state()
+            raise RuntimeError(f"Request {request_id} was aborted before activation")
+
+        # Reinstall from current truth instead of a stale local flag.
+        _install_tracking_state()
+        _clear_pending_add_state()
 
         return request_id
 
@@ -314,6 +425,7 @@ class EngineCore:
         """
         request_ids = list(self._output_collectors.keys())
         for rid in request_ids:
+            self._mark_pending_add_retired(rid)
             self.scheduler.abort_request(rid)
             collector = self._output_collectors.get(rid)
             if collector is not None:
@@ -339,6 +451,26 @@ class EngineCore:
             )
         return len(request_ids)
 
+    def _pending_add_owns_tracking(
+        self,
+        request_id: str,
+        pending_add: _PendingAddState,
+    ) -> bool:
+        """Return True when routing still belongs to a net-new pending add."""
+        return (
+            not pending_add.had_existing_tracking
+            and self._output_collectors.get(request_id) is pending_add.new_collector
+            and self._stream_states.get(request_id) is pending_add.new_stream_state
+            and self._finished_events.get(request_id) is pending_add.new_finished_event
+        )
+
+    def _mark_pending_add_retired(self, request_id: str) -> _PendingAddState | None:
+        """Mark an in-flight add as retired so late executor success is reconciled."""
+        pending_add = self._pending_adds.get(request_id)
+        if pending_add is not None:
+            pending_add.externally_retired = True
+        return pending_add
+
     def _cleanup_request(self, request_id: str) -> None:
         """Clean up request tracking.
 
@@ -346,6 +478,13 @@ class EngineCore:
         Scheduler state is cleaned by _do_abort_request (deferred abort)
         or _cleanup_finished (normal completion).
         """
+        pending_add = self._mark_pending_add_retired(request_id)
+        if pending_add is not None and self._pending_add_owns_tracking(
+            request_id,
+            pending_add,
+        ):
+            return
+
         collector = self._output_collectors.pop(request_id, None)
         if collector:
             collector.clear()
@@ -596,6 +735,7 @@ class EngineCore:
         self._output_collectors.clear()
         self._stream_states.clear()
         self._finished_events.clear()
+        self._pending_adds.clear()
 
         # Release model and tokenizer references for GC
         self.model = None

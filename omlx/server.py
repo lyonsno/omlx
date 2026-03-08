@@ -39,6 +39,7 @@ The server provides:
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -219,16 +220,36 @@ async def verify_api_key(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> bool:
     """Verify API key if configured."""
+    def _key_fingerprint(value: str | None) -> str:
+        """Return a short, non-reversible fingerprint for debug logging."""
+        if not value:
+            return "none"
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+
     # No auth required if no API key is configured
     if _server_state.api_key is None:
         return True
 
     # Check if credentials provided
     if credentials is None:
+        logger.warning(
+            "API key required but missing Authorization header "
+            "(expected_len=%s expected_fp=%s)",
+            len(_server_state.api_key),
+            _key_fingerprint(_server_state.api_key),
+        )
         raise HTTPException(status_code=401, detail="API key required")
 
     # Constant-time comparison
     if not secrets.compare_digest(credentials.credentials, _server_state.api_key):
+        logger.warning(
+            "Invalid API key "
+            "(provided_len=%s expected_len=%s provided_fp=%s expected_fp=%s)",
+            len(credentials.credentials),
+            len(_server_state.api_key),
+            _key_fingerprint(credentials.credentials),
+            _key_fingerprint(_server_state.api_key),
+        )
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     return True
