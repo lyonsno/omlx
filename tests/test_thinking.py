@@ -80,6 +80,42 @@ class TestExtractThinking:
         assert "Let me reason..." in thinking
         assert "Final answer." in content
 
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "  keep edge spaces  ",
+            "\tkeep\t",
+            "\nkeep\n",
+            " \t\nkeep\n\t ",
+        ],
+    )
+    def test_no_tags_preserves_outer_whitespace(self, source):
+        """No-tag text should round-trip exactly (no implicit trimming)."""
+        thinking, content = extract_thinking(source)
+        assert thinking == ""
+        assert content == source
+
+    @pytest.mark.parametrize(
+        ("source", "expected_tokens"),
+        [
+            ("Use </think> literally and <think>real</think> done", ["Use", "literally", "done"]),
+            ("<think>real</think> done </think>", ["done"]),
+            ("pre </think> mid </think> <think>real</think> tail", ["pre", "mid", "tail"]),
+        ],
+    )
+    def test_literal_close_tag_outside_block_is_suppressed_from_visible_content(
+        self,
+        source,
+        expected_tokens,
+    ):
+        """Reserved close tags should not leak into user-visible content."""
+        thinking, content = extract_thinking(source)
+        assert thinking == "real"
+        assert "<think>" not in content
+        assert "</think>" not in content
+        for token in expected_tokens:
+            assert token in content
+
     def test_duplicate_open_tag_does_not_leak_into_thinking(self):
         """Duplicate <think> opens should still return clean thinking/content."""
         thinking, content = extract_thinking(

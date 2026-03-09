@@ -761,8 +761,56 @@ class TestOpenAIAdapter:
         assert "<think>" not in json.dumps([first_delta, second_delta])
         assert "</think>" not in json.dumps([first_delta, second_delta])
 
-    def test_format_stream_chunk_preserves_state_across_equivalent_request_objects(self, adapter):
-        """Equivalent request objects should share stream parsing state."""
+    def test_format_stream_chunk_isolates_equivalent_requests_when_streams_interleave(self, adapter):
+        """Equivalent request payloads should not cross-contaminate parser state."""
+        request_a = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        request_b = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+
+        # Stream A starts with an incomplete tag so parser state must keep a
+        # buffered partial tag specific to A.
+        a_first = adapter.format_stream_chunk(
+            StreamChunk(text="<thi", is_first=True),
+            request_a,
+        )
+        # Stream B runs to completion while A is still mid-tag.
+        b_first = adapter.format_stream_chunk(
+            StreamChunk(text="<think>B</think>", is_first=True),
+            request_b,
+        )
+        b_last = adapter.format_stream_chunk(
+            StreamChunk(text="B!", is_last=True),
+            request_b,
+        )
+        # Stream A resumes; it should recover its buffered "<thi" and parse
+        # "<think>A1</think>A!" correctly.
+        a_last = adapter.format_stream_chunk(
+            StreamChunk(text="nk>A1</think>A!", is_last=True),
+            request_a,
+        )
+
+        a_first_delta = json.loads(a_first[6:-2])["choices"][0]["delta"]
+        b_first_delta = json.loads(b_first[6:-2])["choices"][0]["delta"]
+        b_last_delta = json.loads(b_last[6:-2])["choices"][0]["delta"]
+        a_last_delta = json.loads(a_last[6:-2])["choices"][0]["delta"]
+
+        assert a_first_delta["role"] == "assistant"
+        assert "reasoning_content" not in a_first_delta
+        assert "content" not in a_first_delta
+        assert b_first_delta["reasoning_content"] == "B"
+        assert "content" not in b_first_delta
+        assert b_last_delta["content"] == "B!"
+        assert "reasoning_content" not in b_last_delta
+        assert a_last_delta["reasoning_content"] == "A1"
+        assert a_last_delta["content"] == "A!"
+
+    def test_format_stream_chunk_continues_logical_stream_across_equivalent_request_object(self, adapter):
+        """Logical stream continuity should not require request object identity."""
         request1 = ChatCompletionRequest(
             model="test-model",
             messages=[Message(role="user", content="Hello")],
@@ -785,36 +833,210 @@ class TestOpenAIAdapter:
         second_delta = json.loads(second[6:-2])["choices"][0]["delta"]
 
         assert first_delta["reasoning_content"] == "rea"
+        assert "content" not in first_delta
         assert second_delta["reasoning_content"] == "soning"
         assert second_delta["content"] == "Answer"
 
+    @staticmethod
+    def _run_mirrored_end_order_interleaving(adapter):
+        """Run mirrored interleaving schedule and return parsed deltas."""
+        request_a = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        request_b = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+
+        # A starts with a partial tag (buffered parser state).
+        a_first = adapter.format_stream_chunk(
+            StreamChunk(text="<thi", is_first=True),
+            request_a,
+        )
+        # B starts in open-thinking mode without closing in first chunk.
+        b_first = adapter.format_stream_chunk(
+            StreamChunk(text="<think>B", is_first=True),
+            request_b,
+        )
+        # Mirrored end order: A ends before B.
+        a_last = adapter.format_stream_chunk(
+            StreamChunk(text="nk>A1</think>A!", is_last=True),
+            request_a,
+        )
+        b_last = adapter.format_stream_chunk(
+            StreamChunk(text="2</think>B!", is_last=True),
+            request_b,
+        )
+
+        a_first_delta = json.loads(a_first[6:-2])["choices"][0]["delta"]
+        b_first_delta = json.loads(b_first[6:-2])["choices"][0]["delta"]
+        a_last_delta = json.loads(a_last[6:-2])["choices"][0]["delta"]
+        b_last_delta = json.loads(b_last[6:-2])["choices"][0]["delta"]
+
+        return a_first_delta, b_first_delta, a_last_delta, b_last_delta
+
+    def test_format_stream_chunk_isolates_equivalent_requests_mirrored_end_order_stream_a(self, adapter):
+        """Mirrored completion order should preserve stream A state."""
+        a_first_delta, _, a_last_delta, _ = self._run_mirrored_end_order_interleaving(adapter)
+
+        assert a_first_delta["role"] == "assistant"
+        assert "reasoning_content" not in a_first_delta
+        assert "content" not in a_first_delta
+        assert a_last_delta["reasoning_content"] == "A1"
+        assert a_last_delta["content"] == "A!"
+
+    def test_format_stream_chunk_isolates_equivalent_requests_mirrored_end_order_stream_b(self, adapter):
+        """Mirrored completion order should preserve stream B state."""
+        _, b_first_delta, _, b_last_delta = self._run_mirrored_end_order_interleaving(adapter)
+
+        assert b_first_delta["reasoning_content"] == "B"
+        assert "content" not in b_first_delta
+        assert b_last_delta["reasoning_content"] == "2"
+        assert b_last_delta["content"] == "B!"
+
+    def test_stream_parser_state_is_cleared_after_last_chunk(self, adapter):
+        """Parser state should be fully released after natural completion."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        adapter.format_stream_chunk(
+            StreamChunk(text="<think>rea", is_first=True),
+            request,
+        )
+        assert len(adapter._thinking_parsers) == 1
+
+        adapter.format_stream_chunk(
+            StreamChunk(text="soning</think>Answer", is_last=True),
+            request,
+        )
+
+        assert adapter._thinking_parsers == {}
+        assert adapter._request_payload_keys == {}
+        assert adapter._active_request_keys_by_payload == {}
+
+    def test_format_stream_end_equivalent_request_does_not_leave_stale_state_that_breaks_adoption(self, adapter):
+        """Equivalent-object end calls should not strand stale parser state for equal payloads."""
+        request_a = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        request_a_end = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        request_b = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        request_b_resume = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+
+        key_a = adapter._stream_state_key(request_a)
+        key_b = adapter._stream_state_key(request_b)
+        payload_key = adapter._stream_payload_key(request_a)
+
+        # Set up asymmetric parser states so deleting the wrong key is detectable:
+        # A is buffering a partial open tag; B is inside an active think span.
+        adapter.format_stream_chunk(
+            StreamChunk(text="<thi", is_first=True),
+            request_a,
+        )
+        adapter.format_stream_chunk(
+            StreamChunk(text="<think>B", is_first=True),
+            request_b,
+        )
+
+        assert set(adapter._active_request_keys_by_payload[payload_key]) == {key_a, key_b}
+        assert adapter._thinking_parsers[key_a]._buffer == "<thi"
+        assert adapter._thinking_parsers[key_b]._in_thinking is True
+
+        adapter.format_stream_end(request_a_end)
+
+        # Equivalent-object end for A must retire A specifically, not arbitrary
+        # one-of-N payload-matching streams.
+        assert key_a not in adapter._thinking_parsers
+        assert key_b in adapter._thinking_parsers
+        assert set(adapter._active_request_keys_by_payload[payload_key]) == {key_b}
+
+        resumed = adapter.format_stream_chunk(
+            StreamChunk(text="2</think>X", is_last=True),
+            request_b_resume,
+        )
+        resumed_delta = json.loads(resumed[6:-2])["choices"][0]["delta"]
+
+        assert resumed_delta["reasoning_content"] == "2"
+        assert resumed_delta["content"] == "X"
+        assert adapter._thinking_parsers == {}
+        assert adapter._request_payload_keys == {}
+        assert adapter._active_request_keys_by_payload == {}
+
+    def test_format_stream_chunk_state_key_collision_does_not_corrupt_other_stream(self, adapter, monkeypatch):
+        """Stream-key collisions should not let one stream wipe another stream's parser state."""
+        monkeypatch.setattr(adapter, "_stream_state_key", lambda _: 12345)
+
+        request_a = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="A")],
+        )
+        request_b = ChatCompletionRequest(
+            model="other-model",
+            messages=[Message(role="user", content="B")],
+        )
+
+        adapter.format_stream_chunk(
+            StreamChunk(text="<think>A", is_first=True),
+            request_a,
+        )
+        adapter.format_stream_chunk(
+            StreamChunk(text="<think>B", is_first=True),
+            request_b,
+        )
+
+        a_resumed = adapter.format_stream_chunk(
+            StreamChunk(text="2</think>X", is_last=True),
+            request_a,
+        )
+        b_resumed = adapter.format_stream_chunk(
+            StreamChunk(text="3</think>Y", is_last=True),
+            request_b,
+        )
+        a_resumed_delta = json.loads(a_resumed[6:-2])["choices"][0]["delta"]
+        b_resumed_delta = json.loads(b_resumed[6:-2])["choices"][0]["delta"]
+
+        assert a_resumed_delta["reasoning_content"] == "2"
+        assert a_resumed_delta["content"] == "X"
+        assert b_resumed_delta["reasoning_content"] == "3"
+        assert b_resumed_delta["content"] == "Y"
+        assert adapter._thinking_parsers == {}
+        assert adapter._request_payload_keys == {}
+        assert adapter._active_request_keys_by_payload == {}
+
     def test_format_stream_end_clears_parser_state_without_last_chunk(self, adapter):
         """format_stream_end should drop parser state even without an is_last chunk."""
-        request1 = ChatCompletionRequest(
-            model="test-model",
-            messages=[Message(role="user", content="Hello")],
-        )
-        request2 = ChatCompletionRequest(
-            model="test-model",
-            messages=[Message(role="user", content="Hello")],
-        )
-        request3 = ChatCompletionRequest(
+        request = ChatCompletionRequest(
             model="test-model",
             messages=[Message(role="user", content="Hello")],
         )
 
         adapter.format_stream_chunk(
             StreamChunk(text="<think>rea", is_first=True),
-            request1,
+            request,
         )
-        end_marker = adapter.format_stream_end(request2)
-        resumed = adapter.format_stream_chunk(StreamChunk(text="Answer"), request3)
+        end_marker = adapter.format_stream_end(request)
+        resumed = adapter.format_stream_chunk(StreamChunk(text="Answer"), request)
 
         resumed_delta = json.loads(resumed[6:-2])["choices"][0]["delta"]
 
         assert end_marker == "data: [DONE]\n\n"
         assert resumed_delta["content"] == "Answer"
         assert "reasoning_content" not in resumed_delta
+        assert adapter._thinking_parsers == {}
+        assert adapter._request_payload_keys == {}
+        assert adapter._active_request_keys_by_payload == {}
 
     # =========================================================================
     # format_stream_end Tests
