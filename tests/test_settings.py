@@ -1052,7 +1052,9 @@ class TestGlobalSettings:
 
         scheduler_config = settings.to_scheduler_config()
         assert scheduler_config.max_num_seqs == 128
-        assert scheduler_config.prefill_batch_size == 4
+        # prefill_batch_size is no longer part of scheduler.SchedulerConfig
+        # and is hardcoded in scheduler runtime path.
+        assert not hasattr(scheduler_config, "prefill_batch_size")
         assert scheduler_config.completion_batch_size == 16
         assert scheduler_config.initial_cache_blocks == 256  # default
 

@@ -917,7 +917,6 @@ class GlobalSettings:
 
         return SchedulerConfig(
             max_num_seqs=self.scheduler.max_num_seqs,
-            prefill_batch_size=self.scheduler.prefill_batch_size,
             completion_batch_size=self.scheduler.completion_batch_size,
             initial_cache_blocks=self.cache.initial_cache_blocks,
         )
