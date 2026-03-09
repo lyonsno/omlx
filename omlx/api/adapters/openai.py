@@ -44,12 +44,67 @@ class OpenAIAdapter(BaseAdapter):
     def __init__(self):
         # Track parser state per request so raw <think> markup split across
         # chunks is partitioned consistently throughout the stream.
-        self._thinking_parsers: dict[str, ThinkingParser] = {}
+        self._thinking_parsers: dict[int, ThinkingParser] = {}
+        self._request_payload_keys: dict[int, str] = {}
+        self._active_request_keys_by_payload: dict[str, set[int]] = {}
 
     @staticmethod
-    def _stream_state_key(request: ChatCompletionRequest) -> str:
-        """Build a stable key for a logical stream from request content."""
+    def _stream_state_key(request: ChatCompletionRequest) -> int:
+        """Build an instance-local key for a request object."""
+        return id(request)
+
+    @staticmethod
+    def _stream_payload_key(request: ChatCompletionRequest) -> str:
+        """Build a deterministic payload key for logical stream continuity."""
         return request.model_dump_json(exclude_none=False)
+
+    def _register_stream_key(
+        self,
+        request_key: int,
+        payload_key: str,
+        parser: ThinkingParser,
+    ) -> None:
+        self._thinking_parsers[request_key] = parser
+        self._request_payload_keys[request_key] = payload_key
+        self._active_request_keys_by_payload.setdefault(payload_key, set()).add(request_key)
+
+    def _deregister_stream_key(self, request_key: int) -> None:
+        self._thinking_parsers.pop(request_key, None)
+        payload_key = self._request_payload_keys.pop(request_key, None)
+        if not payload_key:
+            return
+
+        keys = self._active_request_keys_by_payload.get(payload_key)
+        if not keys:
+            return
+
+        keys.discard(request_key)
+        if not keys:
+            self._active_request_keys_by_payload.pop(payload_key, None)
+
+    def _adopt_equivalent_stream(
+        self,
+        request_key: int,
+        payload_key: str,
+    ) -> ThinkingParser | None:
+        active_keys = self._active_request_keys_by_payload.get(payload_key)
+        if not active_keys or len(active_keys) != 1:
+            return None
+
+        existing_key = next(iter(active_keys))
+        parser = self._thinking_parsers.get(existing_key)
+        if parser is None:
+            self._deregister_stream_key(existing_key)
+            return None
+
+        if existing_key == request_key:
+            return parser
+
+        # Move ownership so a rehydrated equivalent request can continue the
+        # same logical stream without object-identity coupling.
+        self._deregister_stream_key(existing_key)
+        self._register_stream_key(request_key, payload_key, parser)
+        return parser
 
     @property
     def name(self) -> str:
@@ -164,13 +219,24 @@ class OpenAIAdapter(BaseAdapter):
         """
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         request_key = self._stream_state_key(request)
+        payload_key = self._stream_payload_key(request)
 
         content = chunk.text or ""
         extracted_thinking = ""
+        transient_parser = False
         parser = self._thinking_parsers.get(request_key)
-        if chunk.is_first or parser is None:
+        if chunk.is_first:
+            self._deregister_stream_key(request_key)
             parser = ThinkingParser()
-            self._thinking_parsers[request_key] = parser
+            self._register_stream_key(request_key, payload_key, parser)
+        elif parser is None:
+            parser = self._adopt_equivalent_stream(request_key, payload_key)
+            if parser is None:
+                parser = ThinkingParser()
+                if "<" in content or chunk.reasoning_content or chunk.is_last:
+                    self._register_stream_key(request_key, payload_key, parser)
+                else:
+                    transient_parser = True
 
         if content:
             extracted_thinking, content = parser.feed(content)
@@ -179,7 +245,8 @@ class OpenAIAdapter(BaseAdapter):
             tail_thinking, tail_content = parser.finish()
             extracted_thinking += tail_thinking
             content += tail_content
-            self._thinking_parsers.pop(request_key, None)
+            if not transient_parser:
+                self._deregister_stream_key(request_key)
 
         reasoning_content = strip_think_tags(
             chunk.reasoning_content or extracted_thinking,
@@ -227,7 +294,17 @@ class OpenAIAdapter(BaseAdapter):
         Returns:
             SSE-formatted end marker.
         """
-        self._thinking_parsers.pop(self._stream_state_key(request), None)
+        request_key = self._stream_state_key(request)
+        if request_key in self._thinking_parsers:
+            self._deregister_stream_key(request_key)
+            return "data: [DONE]\n\n"
+
+        # Fallback for equivalent-object end calls: only clean up automatically
+        # when exactly one active stream matches this payload.
+        payload_key = self._stream_payload_key(request)
+        active_keys = self._active_request_keys_by_payload.get(payload_key)
+        if active_keys and len(active_keys) == 1:
+            self._deregister_stream_key(next(iter(active_keys)))
         return "data: [DONE]\n\n"
 
     def create_error_response(

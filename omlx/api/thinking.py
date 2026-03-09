@@ -67,12 +67,13 @@ def extract_thinking(text: str) -> Tuple[str, str]:
 
     # Robust state-machine extraction for malformed/mixed tag streams:
     # - duplicate opening tags: "<think><think>..."
-    # - extra closing tags: "</think></think>"
+    # - duplicate wrapper closings: "</think></think>"
     # - unclosed thinking blocks at end of output
     thinking_parts: List[str] = []
     content_parts: List[str] = []
     current_thinking: List[str] = []
     in_thinking = False
+    saw_structural_think_tag = False
     i = 0
 
     while i < len(text):
@@ -80,15 +81,19 @@ def extract_thinking(text: str) -> Tuple[str, str]:
 
         if remaining.startswith(_OPEN_TAG):
             # Duplicate opens are treated as idempotent.
+            saw_structural_think_tag = True
             in_thinking = True
             i += _OPEN_LEN
             continue
 
         if remaining.startswith(_CLOSE_TAG):
             if in_thinking:
+                saw_structural_think_tag = True
                 thinking_parts.append("".join(current_thinking).strip())
                 current_thinking = []
                 in_thinking = False
+            # Outside a think span, reserved close tags are treated as control
+            # markers and suppressed from user-visible content.
             i += _CLOSE_LEN
             continue
 
@@ -100,7 +105,12 @@ def extract_thinking(text: str) -> Tuple[str, str]:
 
     # If stream ends inside thinking, treat the trailing text as thinking.
     if in_thinking:
+        saw_structural_think_tag = True
         thinking_parts.append("".join(current_thinking).strip())
+
+    # No structural think tags found: preserve content fidelity exactly.
+    if not saw_structural_think_tag:
+        return ("", text)
 
     # Keep block boundaries for multi-think outputs while dropping empty blocks.
     non_empty_thinking = [part for part in thinking_parts if part]
