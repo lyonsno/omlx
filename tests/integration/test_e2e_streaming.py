@@ -545,6 +545,168 @@ class TestStreamingHelperFunctions:
         data = json.loads(json_str)
         assert data["choices"][0]["delta"].get("role") == "assistant"
 
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_with_tools_streams_content_incrementally(self):
+        """Tool availability must not force full buffering of normal text deltas."""
+        from omlx.server import stream_chat_completion
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="Hello",
+                new_text="Hello",
+                completion_tokens=1,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text="Hello world",
+                new_text=" world",
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+            ),
+        ])
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }]
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+            tools=tools,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_chat_completion(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=tools,
+        ):
+            events.append(event)
+
+        payloads = [
+            json.loads(event[6:-2])
+            for event in events
+            if event.startswith("data: {")
+        ]
+        content_deltas = [
+            payload["choices"][0].get("delta", {}).get("content")
+            for payload in payloads
+            if payload.get("choices")
+        ]
+        content_deltas = [delta for delta in content_deltas if delta]
+
+        # With two streamed model outputs, we expect two incremental content chunks,
+        # not one buffered chunk emitted only at completion.
+        assert content_deltas == ["Hello", " world"]
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_with_tools_and_tool_calls_keeps_prior_content(self):
+        """A tool_call finish should end the turn, not suppress already-generated text."""
+        from omlx.server import stream_chat_completion
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="Let me check that for you.",
+                new_text="Let me check that for you.",
+                completion_tokens=1,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text="Let me check that for you.",
+                new_text="",
+                completion_tokens=1,
+                finished=True,
+                finish_reason="tool_calls",
+                tool_calls=[{
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"SF\"}",
+                }],
+            ),
+        ])
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }]
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+            tools=tools,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_chat_completion(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=tools,
+        ):
+            events.append(event)
+
+        payloads = [
+            json.loads(event[6:-2])
+            for event in events
+            if event.startswith("data: {")
+        ]
+        content_deltas = []
+        saw_tool_call_delta = False
+        finish_reasons = []
+
+        for payload in payloads:
+            choices = payload.get("choices", [])
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta", {})
+            content = delta.get("content")
+            if content:
+                content_deltas.append(content)
+            if delta.get("tool_calls"):
+                saw_tool_call_delta = True
+            finish_reason = choice.get("finish_reason")
+            if finish_reason:
+                finish_reasons.append(finish_reason)
+
+        assert content_deltas == ["Let me check that for you."]
+        assert saw_tool_call_delta is True
+        assert "tool_calls" in finish_reasons
+
 
 class TestStreamingEdgeCases:
     """Tests for edge cases in streaming responses."""

@@ -1715,9 +1715,9 @@ async def stream_chat_completion(
 ) -> AsyncIterator[str]:
     """Stream chat completion response.
 
-    Streams content tokens with reasoning/thinking separation, then at
-    completion parses tool calls from accumulated text and emits them
-    as structured tool_calls chunks (OpenAI streaming format).
+    Streams content tokens with reasoning/thinking separation. At completion,
+    parses tool calls from accumulated text and emits structured tool_calls
+    chunks (OpenAI streaming format) when present.
     """
     start_time = time.perf_counter()
     first_token_time = None
@@ -1725,6 +1725,7 @@ async def stream_chat_completion(
     accumulated_text = ""
     has_tools = bool(kwargs.get("tools"))
     thinking_parser = ThinkingParser()
+    emitted_content_delta = False
 
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
@@ -1738,9 +1739,9 @@ async def stream_chat_completion(
     )
     yield f"data: {first_chunk.model_dump_json(exclude_none=True)}\n\n"
 
-    # Stream content — buffer when tools are present so we can strip
-    # tool call markup before emitting (prevents clients from seeing
-    # tool calls in both content and structured tool_calls chunks).
+    # Stream content incrementally regardless of tools. Tool calls still end
+    # the turn via finish_reason/tool_call chunks, but we do not withhold
+    # previously generated assistant text.
     try:
         async for output in engine.stream_chat(messages=messages, **kwargs):
             if first_token_time is None and output.new_text:
@@ -1749,7 +1750,7 @@ async def stream_chat_completion(
             if output.new_text:
                 accumulated_text += output.new_text
 
-            if not has_tools and output.new_text:
+            if output.new_text:
                 thinking_delta, content_delta = thinking_parser.feed(output.new_text)
 
                 # Emit reasoning_content delta
@@ -1766,6 +1767,7 @@ async def stream_chat_completion(
 
                 # Emit content delta
                 if content_delta:
+                    emitted_content_delta = True
                     chunk = ChatCompletionChunk(
                         id=response_id,
                         model=request.model,
@@ -1789,29 +1791,29 @@ async def stream_chat_completion(
         yield "data: [DONE]\n\n"
         return
 
-    # Flush remaining buffered content from thinking parser
-    if not has_tools:
-        thinking_delta, content_delta = thinking_parser.finish()
-        if thinking_delta:
-            chunk = ChatCompletionChunk(
-                id=response_id,
-                model=request.model,
-                choices=[ChatCompletionChunkChoice(
-                    delta=ChatCompletionChunkDelta(reasoning_content=thinking_delta),
-                    finish_reason=None,
-                )],
-            )
-            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
-        if content_delta:
-            chunk = ChatCompletionChunk(
-                id=response_id,
-                model=request.model,
-                choices=[ChatCompletionChunkChoice(
-                    delta=ChatCompletionChunkDelta(content=content_delta),
-                    finish_reason=None,
-                )],
-            )
-            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+    # Flush remaining buffered content from thinking parser.
+    thinking_delta, content_delta = thinking_parser.finish()
+    if thinking_delta:
+        chunk = ChatCompletionChunk(
+            id=response_id,
+            model=request.model,
+            choices=[ChatCompletionChunkChoice(
+                delta=ChatCompletionChunkDelta(reasoning_content=thinking_delta),
+                finish_reason=None,
+            )],
+        )
+        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+    if content_delta:
+        emitted_content_delta = True
+        chunk = ChatCompletionChunk(
+            id=response_id,
+            model=request.model,
+            choices=[ChatCompletionChunkChoice(
+                delta=ChatCompletionChunkDelta(content=content_delta),
+                finish_reason=None,
+            )],
+        )
+        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
     # Parse tool calls from accumulated text
     tool_calls = None
@@ -1839,21 +1841,11 @@ async def stream_chat_completion(
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
         )
+        _ = thinking_content  # thinking already streamed incrementally above
 
-        # Emit reasoning_content if present (buffered mode)
-        if thinking_content:
-            rc_chunk = ChatCompletionChunk(
-                id=response_id,
-                model=request.model,
-                choices=[ChatCompletionChunkChoice(
-                    delta=ChatCompletionChunkDelta(reasoning_content=thinking_content),
-                    finish_reason=None,
-                )],
-            )
-            yield f"data: {rc_chunk.model_dump_json(exclude_none=True)}\n\n"
-
-    # When tools were requested, emit buffered content now (cleaned of markup)
-    if has_tools and cleaned_text:
+    # Fallback for tool-enabled paths: if nothing was streamed as content
+    # (rare), emit cleaned text once to avoid an empty assistant turn.
+    if has_tools and cleaned_text and not emitted_content_delta:
         content_chunk = ChatCompletionChunk(
             id=response_id,
             model=request.model,
