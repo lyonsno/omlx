@@ -4647,6 +4647,54 @@ class TestSchedulerBoundarySnapshots:
         assert request.request_id not in scheduler._boundary_cache_snapshots
 
 
+class TestBoundarySnapshotBatchGeneratorPromptTupleCompatibility:
+    """Guard prompt-tuple compatibility with mlx-lm BatchGenerator."""
+
+    def _make_bg_stub(self):
+        from omlx.scheduler import _BoundarySnapshotBatchGenerator
+
+        bg = object.__new__(_BoundarySnapshotBatchGenerator)
+        bg._vlm_pending = {}
+        bg._stats = SimpleNamespace(prompt_tokens=0)
+        return bg
+
+    def test_process_prompts_accepts_seven_field_prompt_tuples(self, monkeypatch):
+        """mlx-lm 0.31+ provides a 7th prompt_checkpoints field."""
+        import omlx.scheduler as scheduler_module
+
+        bg = self._make_bg_stub()
+
+        class _StopAfterUnpack(Exception):
+            pass
+
+        def _stop_after_unpack(_tokens):
+            raise _StopAfterUnpack
+
+        monkeypatch.setattr(scheduler_module.mx, "array", _stop_after_unpack)
+        prompts = [(7, [1, 2], 16, [MagicMock()], None, [], -1)]
+
+        with pytest.raises(_StopAfterUnpack):
+            bg._process_prompts(prompts)
+
+    def test_process_prompts_still_accepts_six_field_prompt_tuples(self, monkeypatch):
+        """Older prompt tuples without prompt_checkpoints stay supported."""
+        import omlx.scheduler as scheduler_module
+
+        bg = self._make_bg_stub()
+
+        class _StopAfterUnpack(Exception):
+            pass
+
+        def _stop_after_unpack(_tokens):
+            raise _StopAfterUnpack
+
+        monkeypatch.setattr(scheduler_module.mx, "array", _stop_after_unpack)
+        prompts = [(8, [3, 4], 32, [MagicMock()], None, [])]
+
+        with pytest.raises(_StopAfterUnpack):
+            bg._process_prompts(prompts)
+
+
 class TestSchedulerRotatingBlockAlignment:
     """Tests for rotating window/block-size alignment."""
 

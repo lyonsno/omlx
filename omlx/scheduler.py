@@ -321,7 +321,26 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         return sampled, list(logprobs)
 
     def _process_prompts(self, prompts):
-        uids, inputs, max_tokens, caches, samplers, logits_processors = zip(*prompts)
+        prompt_width = len(prompts[0])
+        if any(len(prompt) != prompt_width for prompt in prompts):
+            raise ValueError("Inconsistent prompt tuple width in BatchGenerator prompts")
+
+        if prompt_width == 7:
+            (
+                uids,
+                inputs,
+                max_tokens,
+                caches,
+                samplers,
+                logits_processors,
+                _prompt_checkpoints,
+            ) = zip(*prompts)
+        elif prompt_width == 6:
+            uids, inputs, max_tokens, caches, samplers, logits_processors = zip(*prompts)
+        else:
+            raise ValueError(
+                f"Unsupported prompt tuple width {prompt_width}; expected 6 or 7"
+            )
 
         lengths = [len(p) for p in inputs]
         max_length = max(lengths)
