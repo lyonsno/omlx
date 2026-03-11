@@ -347,11 +347,12 @@ class ToolCallStreamFilter:
             starts.append((ns_match.start(), len(ns_match.group(0)), f"</{ns}:tool_call>"))
 
         bracket_idx = text.find(self._bracket_prefix)
-        if bracket_idx >= 0:
+        while bracket_idx >= 0:
             bracket_candidate = text[bracket_idx:]
             bracket_match = self._bracket_call_re.match(bracket_candidate)
             if bracket_match:
                 starts.append((bracket_idx, bracket_match.end(), None))
+            bracket_idx = text.find(self._bracket_prefix, bracket_idx + 1)
 
         if not starts:
             return None
@@ -400,7 +401,7 @@ class ToolCallStreamFilter:
             if self._could_be_partial_namespaced_open(candidate):
                 keep = max(keep, len(candidate))
 
-        bracket_idx = text.find(self._bracket_prefix)
+        bracket_idx = text.rfind(self._bracket_prefix)
         if bracket_idx >= 0:
             bracket_candidate = text[bracket_idx:]
             # Hold unresolved bracket prefix until we can classify parseable
@@ -422,6 +423,9 @@ class ToolCallStreamFilter:
         for marker, _close in self._marker_pairs:
             if marker.startswith(tail):
                 return True
+
+        if tail.startswith(self._bracket_prefix):
+            return True
 
         if not tail.startswith("<"):
             return False
