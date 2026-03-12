@@ -142,7 +142,7 @@ class OpenAIAdapter(BaseAdapter):
         )
         return parser, request_key
 
-    def _clear_ended_payload_keys(self, payload_key: str) -> None:
+    def _clear_ended_payload_keys(self, payload_key: str) -> bool:
         stale_request_ids = [
             request_object_id
             for request_object_id, ended_payload_key in self._ended_request_payload_keys.items()
@@ -150,6 +150,7 @@ class OpenAIAdapter(BaseAdapter):
         ]
         for request_object_id in stale_request_ids:
             self._ended_request_payload_keys.pop(request_object_id, None)
+        return bool(stale_request_ids)
 
     @property
     def name(self) -> str:
@@ -386,9 +387,14 @@ class OpenAIAdapter(BaseAdapter):
         payload_key = self._ended_request_payload_keys.pop(request_object_id, None)
         if payload_key is None:
             payload_key = self._stream_payload_key(request)
-        self._clear_ended_payload_keys(payload_key)
+        cleared_completed_stream = self._clear_ended_payload_keys(payload_key)
         active_keys = self._active_request_keys_by_payload.get(payload_key)
         if active_keys:
+            # If we just cleared delayed completion bookkeeping for this
+            # payload, do not tear down a newer live parser that happens to
+            # share the same request body.
+            if cleared_completed_stream:
+                return "data: [DONE]\n\n"
             # An equivalent-but-different request object cannot disambiguate
             # between multiple live streams with identical payloads.
             if len(active_keys) > 1:

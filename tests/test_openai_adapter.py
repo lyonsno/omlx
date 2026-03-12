@@ -1175,6 +1175,52 @@ class TestOpenAIAdapter:
 
         assert adapter._ended_request_payload_keys == {}
 
+    def test_delayed_equivalent_stream_end_for_completed_stream_does_not_remove_newer_live_parser(self, adapter):
+        """Delayed end for a completed stream must not tear down a newer live parser with same payload."""
+        request_a = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        request_a_end = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        request_b = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+
+        key_b = adapter._stream_state_key(request_b)
+
+        adapter.format_stream_chunk(
+            StreamChunk(text="<think>A</think>done", is_first=True, is_last=True),
+            request_a,
+        )
+        assert len(adapter._ended_request_payload_keys) == 1
+
+        adapter.format_stream_chunk(
+            StreamChunk(text="<think>B", is_first=True),
+            request_b,
+        )
+        assert key_b in adapter._thinking_parsers
+
+        adapter.format_stream_end(request_a_end)
+
+        assert key_b in adapter._thinking_parsers
+        assert adapter._ended_request_payload_keys == {}
+
+        resumed = adapter.format_stream_chunk(
+            StreamChunk(text="2</think>X", is_last=True),
+            request_b,
+        )
+        resumed_delta = json.loads(resumed[6:-2])["choices"][0]["delta"]
+
+        assert resumed_delta["reasoning_content"] == "2"
+        assert resumed_delta["content"] == "X"
+        assert adapter._thinking_parsers == {}
+        assert adapter._request_payload_keys == {}
+        assert adapter._active_request_keys_by_payload == {}
+
     def test_format_stream_end_clears_parser_state_without_last_chunk(self, adapter):
         """format_stream_end should drop parser state even without an is_last chunk."""
         request = ChatCompletionRequest(
