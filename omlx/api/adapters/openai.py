@@ -47,17 +47,31 @@ class OpenAIAdapter(BaseAdapter):
         self._thinking_parsers: dict[int, ThinkingParser] = {}
         self._request_payload_keys: dict[int, str] = {}
         self._active_request_keys_by_payload: dict[str, set[int]] = {}
+        self._stream_request_object_ids: dict[int, int] = {}
+        self._ended_request_payload_keys: dict[int, str] = {}
         self._stream_touch_seq = 0
         self._stream_last_touched: dict[int, int] = {}
+        self._stream_birth_seq = 0
+        self._stream_birth_order: dict[int, int] = {}
 
     @staticmethod
     def _stream_state_key(request: ChatCompletionRequest) -> int:
         """Build an instance-local key for a request object."""
         return id(request)
 
-    @staticmethod
-    def _stream_payload_key(request: ChatCompletionRequest) -> str:
+    def _stream_payload_key(self, request: ChatCompletionRequest) -> str:
         """Build a deterministic payload key for logical stream continuity."""
+        request_key = self._stream_state_key(request)
+        request_object_id = id(request)
+        if self._stream_request_object_ids.get(request_key) == request_object_id:
+            payload_key = self._request_payload_keys.get(request_key)
+            if payload_key is not None:
+                return payload_key
+
+        payload_key = self._ended_request_payload_keys.get(request_object_id)
+        if payload_key is not None:
+            return payload_key
+
         return request.model_dump_json(exclude_none=False)
 
     def _register_stream_key(
@@ -65,10 +79,20 @@ class OpenAIAdapter(BaseAdapter):
         request_key: int,
         payload_key: str,
         parser: ThinkingParser,
+        *,
+        birth_order: int | None = None,
+        request_object_id: int | None = None,
     ) -> None:
         self._thinking_parsers[request_key] = parser
         self._request_payload_keys[request_key] = payload_key
         self._active_request_keys_by_payload.setdefault(payload_key, set()).add(request_key)
+        if request_object_id is None:
+            request_object_id = request_key
+        self._stream_request_object_ids[request_key] = request_object_id
+        if birth_order is None:
+            self._stream_birth_seq += 1
+            birth_order = self._stream_birth_seq
+        self._stream_birth_order[request_key] = birth_order
         self._touch_stream_key(request_key)
 
     def _touch_stream_key(self, request_key: int) -> None:
@@ -84,10 +108,11 @@ class OpenAIAdapter(BaseAdapter):
     def _deregister_stream_key(self, request_key: int) -> None:
         self._thinking_parsers.pop(request_key, None)
         self._stream_last_touched.pop(request_key, None)
+        self._stream_birth_order.pop(request_key, None)
+        self._stream_request_object_ids.pop(request_key, None)
         payload_key = self._request_payload_keys.pop(request_key, None)
         if not payload_key:
             return
-
         keys = self._active_request_keys_by_payload.get(payload_key)
         if not keys:
             return
@@ -100,6 +125,7 @@ class OpenAIAdapter(BaseAdapter):
         self,
         request_key: int,
         payload_key: str,
+        request_object_id: int,
     ) -> tuple[ThinkingParser | None, int | None]:
         active_keys = self._active_request_keys_by_payload.get(payload_key)
         if not active_keys or len(active_keys) != 1:
@@ -112,6 +138,7 @@ class OpenAIAdapter(BaseAdapter):
             return None, None
 
         if existing_key == request_key:
+            self._stream_request_object_ids[existing_key] = request_object_id
             return parser, existing_key
 
         # If request_key is already occupied by a different payload, keep the
@@ -122,8 +149,15 @@ class OpenAIAdapter(BaseAdapter):
 
         # Move ownership so a rehydrated equivalent request can continue the
         # same logical stream without object-identity coupling.
+        birth_order = self._stream_birth_order.get(existing_key)
         self._deregister_stream_key(existing_key)
-        self._register_stream_key(request_key, payload_key, parser)
+        self._register_stream_key(
+            request_key,
+            payload_key,
+            parser,
+            birth_order=birth_order,
+            request_object_id=request_object_id,
+        )
         return parser, request_key
 
     @property
@@ -241,6 +275,7 @@ class OpenAIAdapter(BaseAdapter):
             SSE-formatted string.
         """
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        request_object_id = id(request)
         request_key = self._stream_state_key(request)
         payload_key = self._stream_payload_key(request)
 
@@ -257,15 +292,29 @@ class OpenAIAdapter(BaseAdapter):
             else:
                 self._deregister_stream_key(request_key)
             parser = ThinkingParser()
-            self._register_stream_key(request_key, payload_key, parser)
+            self._register_stream_key(
+                request_key,
+                payload_key,
+                parser,
+                request_object_id=request_object_id,
+            )
         elif parser is None:
-            parser, adopted_key = self._adopt_equivalent_stream(request_key, payload_key)
+            parser, adopted_key = self._adopt_equivalent_stream(
+                request_key,
+                payload_key,
+                request_object_id,
+            )
             if adopted_key is not None:
                 request_key = adopted_key
             if parser is None:
                 parser = ThinkingParser()
                 if "<" in content or chunk.reasoning_content or chunk.is_last:
-                    self._register_stream_key(request_key, payload_key, parser)
+                    self._register_stream_key(
+                        request_key,
+                        payload_key,
+                        parser,
+                        request_object_id=request_object_id,
+                    )
                 else:
                     transient_parser = True
 
@@ -279,6 +328,10 @@ class OpenAIAdapter(BaseAdapter):
             extracted_thinking += tail_thinking
             content += tail_content
             if not transient_parser:
+                if self._stream_request_object_ids.get(request_key) == request_object_id:
+                    payload_key = self._request_payload_keys.get(request_key)
+                    if payload_key is not None:
+                        self._ended_request_payload_keys[request_object_id] = payload_key
                 self._deregister_stream_key(request_key)
 
         reasoning_content = strip_think_tags(
@@ -327,14 +380,22 @@ class OpenAIAdapter(BaseAdapter):
         Returns:
             SSE-formatted end marker.
         """
+        request_object_id = id(request)
         request_key = self._stream_state_key(request)
-        if request_key in self._thinking_parsers:
+        if (
+            request_key in self._thinking_parsers
+            and self._stream_request_object_ids.get(request_key) == request_object_id
+        ):
             self._deregister_stream_key(request_key)
+            self._ended_request_payload_keys.pop(request_object_id, None)
             return "data: [DONE]\n\n"
 
-        # Fallback for equivalent-object end calls. If multiple active streams
-        # share the same payload, retire the least-recently-touched one.
-        payload_key = self._stream_payload_key(request)
+        # Fallback for equivalent-object end calls. When multiple live streams
+        # share the same payload, retire the oldest surviving logical stream so
+        # equivalent object lifecycles resolve deterministically.
+        payload_key = self._ended_request_payload_keys.pop(request_object_id, None)
+        if payload_key is None:
+            payload_key = self._stream_payload_key(request)
         active_keys = self._active_request_keys_by_payload.get(payload_key)
         if active_keys:
             if len(active_keys) == 1:
@@ -342,7 +403,7 @@ class OpenAIAdapter(BaseAdapter):
             else:
                 cleanup_key = min(
                     active_keys,
-                    key=lambda k: self._stream_last_touched.get(k, float("inf")),
+                    key=lambda k: self._stream_birth_order.get(k, float("inf")),
                 )
             self._deregister_stream_key(cleanup_key)
         return "data: [DONE]\n\n"

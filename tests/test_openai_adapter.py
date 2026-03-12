@@ -974,6 +974,65 @@ class TestOpenAIAdapter:
         assert adapter._request_payload_keys == {}
         assert adapter._active_request_keys_by_payload == {}
 
+    def test_format_stream_end_equivalent_request_does_not_remove_other_stream_when_ending_stream_was_touched_last(
+        self, adapter
+    ):
+        """Equivalent-object end must retire the intended stream regardless of touch order."""
+        request_a = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        request_a_end = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        request_b = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        request_b_resume = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+
+        key_a = adapter._stream_state_key(request_a)
+        key_b = adapter._stream_state_key(request_b)
+        payload_key = adapter._stream_payload_key(request_a)
+
+        adapter.format_stream_chunk(
+            StreamChunk(text="<thi", is_first=True),
+            request_a,
+        )
+        adapter.format_stream_chunk(
+            StreamChunk(text="<think>B", is_first=True),
+            request_b,
+        )
+        # Touch A most recently so least-recently-touched cleanup would remove B.
+        adapter.format_stream_chunk(
+            StreamChunk(text="n"),
+            request_a,
+        )
+
+        assert set(adapter._active_request_keys_by_payload[payload_key]) == {key_a, key_b}
+
+        adapter.format_stream_end(request_a_end)
+
+        assert key_a not in adapter._thinking_parsers
+        assert key_b in adapter._thinking_parsers
+        assert set(adapter._active_request_keys_by_payload[payload_key]) == {key_b}
+
+        resumed = adapter.format_stream_chunk(
+            StreamChunk(text="2</think>X", is_last=True),
+            request_b_resume,
+        )
+        resumed_delta = json.loads(resumed[6:-2])["choices"][0]["delta"]
+
+        assert resumed_delta["reasoning_content"] == "2"
+        assert resumed_delta["content"] == "X"
+        assert adapter._thinking_parsers == {}
+        assert adapter._request_payload_keys == {}
+        assert adapter._active_request_keys_by_payload == {}
+
     def test_format_stream_chunk_state_key_collision_does_not_corrupt_other_stream(self, adapter, monkeypatch):
         """Stream-key collisions should not let one stream wipe another stream's parser state."""
         monkeypatch.setattr(adapter, "_stream_state_key", lambda _: 12345)
@@ -1014,6 +1073,43 @@ class TestOpenAIAdapter:
         assert adapter._thinking_parsers == {}
         assert adapter._request_payload_keys == {}
         assert adapter._active_request_keys_by_payload == {}
+
+    def test_stream_payload_key_is_not_recomputed_for_every_chunk(self, adapter, monkeypatch):
+        """Payload-key derivation should be cached per request, not serialized per chunk."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        dump_calls = 0
+        original_model_dump_json = ChatCompletionRequest.model_dump_json
+
+        def counted_model_dump_json(self, *args, **kwargs):
+            nonlocal dump_calls
+            if self is request:
+                dump_calls += 1
+            return original_model_dump_json(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            ChatCompletionRequest,
+            "model_dump_json",
+            counted_model_dump_json,
+        )
+
+        adapter.format_stream_chunk(
+            StreamChunk(text="A", is_first=True),
+            request,
+        )
+        adapter.format_stream_chunk(
+            StreamChunk(text="B"),
+            request,
+        )
+        adapter.format_stream_chunk(
+            StreamChunk(text="C", is_last=True),
+            request,
+        )
+        adapter.format_stream_end(request)
+
+        assert dump_calls == 1
 
     def test_format_stream_end_clears_parser_state_without_last_chunk(self, adapter):
         """format_stream_end should drop parser state even without an is_last chunk."""
