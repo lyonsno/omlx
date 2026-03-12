@@ -49,10 +49,6 @@ class OpenAIAdapter(BaseAdapter):
         self._active_request_keys_by_payload: dict[str, set[int]] = {}
         self._stream_request_object_ids: dict[int, int] = {}
         self._ended_request_payload_keys: dict[int, str] = {}
-        self._stream_touch_seq = 0
-        self._stream_last_touched: dict[int, int] = {}
-        self._stream_birth_seq = 0
-        self._stream_birth_order: dict[int, int] = {}
 
     @staticmethod
     def _stream_state_key(request: ChatCompletionRequest) -> int:
@@ -80,7 +76,6 @@ class OpenAIAdapter(BaseAdapter):
         payload_key: str,
         parser: ThinkingParser,
         *,
-        birth_order: int | None = None,
         request_object_id: int | None = None,
     ) -> None:
         self._thinking_parsers[request_key] = parser
@@ -89,15 +84,6 @@ class OpenAIAdapter(BaseAdapter):
         if request_object_id is None:
             request_object_id = request_key
         self._stream_request_object_ids[request_key] = request_object_id
-        if birth_order is None:
-            self._stream_birth_seq += 1
-            birth_order = self._stream_birth_seq
-        self._stream_birth_order[request_key] = birth_order
-        self._touch_stream_key(request_key)
-
-    def _touch_stream_key(self, request_key: int) -> None:
-        self._stream_touch_seq += 1
-        self._stream_last_touched[request_key] = self._stream_touch_seq
 
     def _allocate_collision_key(self, request_key: int) -> int:
         candidate = request_key
@@ -107,8 +93,6 @@ class OpenAIAdapter(BaseAdapter):
 
     def _deregister_stream_key(self, request_key: int) -> None:
         self._thinking_parsers.pop(request_key, None)
-        self._stream_last_touched.pop(request_key, None)
-        self._stream_birth_order.pop(request_key, None)
         self._stream_request_object_ids.pop(request_key, None)
         payload_key = self._request_payload_keys.pop(request_key, None)
         if not payload_key:
@@ -149,16 +133,23 @@ class OpenAIAdapter(BaseAdapter):
 
         # Move ownership so a rehydrated equivalent request can continue the
         # same logical stream without object-identity coupling.
-        birth_order = self._stream_birth_order.get(existing_key)
         self._deregister_stream_key(existing_key)
         self._register_stream_key(
             request_key,
             payload_key,
             parser,
-            birth_order=birth_order,
             request_object_id=request_object_id,
         )
         return parser, request_key
+
+    def _clear_ended_payload_keys(self, payload_key: str) -> None:
+        stale_request_ids = [
+            request_object_id
+            for request_object_id, ended_payload_key in self._ended_request_payload_keys.items()
+            if ended_payload_key == payload_key
+        ]
+        for request_object_id in stale_request_ids:
+            self._ended_request_payload_keys.pop(request_object_id, None)
 
     @property
     def name(self) -> str:
@@ -320,8 +311,6 @@ class OpenAIAdapter(BaseAdapter):
 
         if content:
             extracted_thinking, content = parser.feed(content)
-            if request_key in self._thinking_parsers:
-                self._touch_stream_key(request_key)
 
         if chunk.is_last:
             tail_thinking, tail_content = parser.finish()
@@ -386,25 +375,25 @@ class OpenAIAdapter(BaseAdapter):
             request_key in self._thinking_parsers
             and self._stream_request_object_ids.get(request_key) == request_object_id
         ):
+            payload_key = self._request_payload_keys.get(request_key)
             self._deregister_stream_key(request_key)
-            self._ended_request_payload_keys.pop(request_object_id, None)
+            if payload_key is not None:
+                self._clear_ended_payload_keys(payload_key)
+            else:
+                self._ended_request_payload_keys.pop(request_object_id, None)
             return "data: [DONE]\n\n"
 
-        # Fallback for equivalent-object end calls. When multiple live streams
-        # share the same payload, retire the oldest surviving logical stream so
-        # equivalent object lifecycles resolve deterministically.
         payload_key = self._ended_request_payload_keys.pop(request_object_id, None)
         if payload_key is None:
             payload_key = self._stream_payload_key(request)
+        self._clear_ended_payload_keys(payload_key)
         active_keys = self._active_request_keys_by_payload.get(payload_key)
         if active_keys:
-            if len(active_keys) == 1:
-                cleanup_key = next(iter(active_keys))
-            else:
-                cleanup_key = min(
-                    active_keys,
-                    key=lambda k: self._stream_birth_order.get(k, float("inf")),
-                )
+            # An equivalent-but-different request object cannot disambiguate
+            # between multiple live streams with identical payloads.
+            if len(active_keys) > 1:
+                return "data: [DONE]\n\n"
+            cleanup_key = next(iter(active_keys))
             self._deregister_stream_key(cleanup_key)
         return "data: [DONE]\n\n"
 

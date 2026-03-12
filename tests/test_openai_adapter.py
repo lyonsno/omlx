@@ -916,8 +916,10 @@ class TestOpenAIAdapter:
         assert adapter._request_payload_keys == {}
         assert adapter._active_request_keys_by_payload == {}
 
-    def test_format_stream_end_equivalent_request_does_not_leave_stale_state_that_breaks_adoption(self, adapter):
-        """Equivalent-object end calls should not strand stale parser state for equal payloads."""
+    def test_format_stream_end_equivalent_request_does_not_guess_when_multiple_same_payload_streams_are_live(
+        self, adapter
+    ):
+        """Equivalent-object end should be a no-op when multiple live streams share a payload."""
         request_a = ChatCompletionRequest(
             model="test-model",
             messages=[Message(role="user", content="Hello")],
@@ -954,43 +956,33 @@ class TestOpenAIAdapter:
         assert adapter._thinking_parsers[key_a]._buffer == "<thi"
         assert adapter._thinking_parsers[key_b]._in_thinking is True
 
-        adapter.format_stream_end(request_a_end)
+        end_marker = adapter.format_stream_end(request_a_end)
 
-        # Equivalent-object end for A must retire A specifically, not arbitrary
-        # one-of-N payload-matching streams.
-        assert key_a not in adapter._thinking_parsers
+        assert end_marker == "data: [DONE]\n\n"
+        assert key_a in adapter._thinking_parsers
         assert key_b in adapter._thinking_parsers
-        assert set(adapter._active_request_keys_by_payload[payload_key]) == {key_b}
+        assert set(adapter._active_request_keys_by_payload[payload_key]) == {key_a, key_b}
 
         resumed = adapter.format_stream_chunk(
             StreamChunk(text="2</think>X", is_last=True),
-            request_b_resume,
+            request_b,
         )
         resumed_delta = json.loads(resumed[6:-2])["choices"][0]["delta"]
 
         assert resumed_delta["reasoning_content"] == "2"
         assert resumed_delta["content"] == "X"
-        assert adapter._thinking_parsers == {}
-        assert adapter._request_payload_keys == {}
-        assert adapter._active_request_keys_by_payload == {}
+        assert key_a in adapter._thinking_parsers
+        assert adapter._thinking_parsers[key_a]._buffer == "<thi"
 
-    def test_format_stream_end_equivalent_request_does_not_remove_other_stream_when_ending_stream_was_touched_last(
+    def test_format_stream_end_exact_request_removes_matching_stream_even_when_other_stream_was_touched_last(
         self, adapter
     ):
-        """Equivalent-object end must retire the intended stream regardless of touch order."""
+        """Exact-object end should retire the matching live stream regardless of touch order."""
         request_a = ChatCompletionRequest(
             model="test-model",
             messages=[Message(role="user", content="Hello")],
         )
-        request_a_end = ChatCompletionRequest(
-            model="test-model",
-            messages=[Message(role="user", content="Hello")],
-        )
         request_b = ChatCompletionRequest(
-            model="test-model",
-            messages=[Message(role="user", content="Hello")],
-        )
-        request_b_resume = ChatCompletionRequest(
             model="test-model",
             messages=[Message(role="user", content="Hello")],
         )
@@ -1015,20 +1007,20 @@ class TestOpenAIAdapter:
 
         assert set(adapter._active_request_keys_by_payload[payload_key]) == {key_a, key_b}
 
-        adapter.format_stream_end(request_a_end)
+        adapter.format_stream_end(request_b)
 
-        assert key_a not in adapter._thinking_parsers
-        assert key_b in adapter._thinking_parsers
-        assert set(adapter._active_request_keys_by_payload[payload_key]) == {key_b}
+        assert key_a in adapter._thinking_parsers
+        assert key_b not in adapter._thinking_parsers
+        assert set(adapter._active_request_keys_by_payload[payload_key]) == {key_a}
 
         resumed = adapter.format_stream_chunk(
-            StreamChunk(text="2</think>X", is_last=True),
-            request_b_resume,
+            StreamChunk(text="k>A1</think>A!", is_last=True),
+            request_a,
         )
         resumed_delta = json.loads(resumed[6:-2])["choices"][0]["delta"]
 
-        assert resumed_delta["reasoning_content"] == "2"
-        assert resumed_delta["content"] == "X"
+        assert resumed_delta["reasoning_content"] == "A1"
+        assert resumed_delta["content"] == "A!"
         assert adapter._thinking_parsers == {}
         assert adapter._request_payload_keys == {}
         assert adapter._active_request_keys_by_payload == {}
@@ -1110,6 +1102,78 @@ class TestOpenAIAdapter:
         adapter.format_stream_end(request)
 
         assert dump_calls == 1
+
+    def test_format_stream_end_equivalent_request_for_newer_stream_does_not_guess_and_corrupt_older_stream(
+        self, adapter
+    ):
+        """Equivalent-object end for a newer stream should leave older live peer untouched."""
+        request_a = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        request_b = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        request_b_end = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+
+        key_a = adapter._stream_state_key(request_a)
+        key_b = adapter._stream_state_key(request_b)
+        payload_key = adapter._stream_payload_key(request_a)
+
+        adapter.format_stream_chunk(
+            StreamChunk(text="<thi", is_first=True),
+            request_a,
+        )
+        adapter.format_stream_chunk(
+            StreamChunk(text="<think>B", is_first=True),
+            request_b,
+        )
+
+        assert set(adapter._active_request_keys_by_payload[payload_key]) == {key_a, key_b}
+
+        # End B using an equivalent (different identity) request object.
+        end_marker = adapter.format_stream_end(request_b_end)
+
+        assert end_marker == "data: [DONE]\n\n"
+        assert key_a in adapter._thinking_parsers
+        assert key_b in adapter._thinking_parsers
+        assert set(adapter._active_request_keys_by_payload[payload_key]) == {key_a, key_b}
+
+        resumed = adapter.format_stream_chunk(
+            StreamChunk(text="nk>A1</think>A!", is_last=True),
+            request_a,
+        )
+        resumed_delta = json.loads(resumed[6:-2])["choices"][0]["delta"]
+
+        assert resumed_delta["reasoning_content"] == "A1"
+        assert resumed_delta["content"] == "A!"
+        assert key_b in adapter._thinking_parsers
+        assert adapter._thinking_parsers[key_b]._in_thinking is True
+
+    def test_equivalent_object_stream_end_clears_ended_payload_key_cache(self, adapter):
+        """Equivalent-object end calls should not leave ended-payload cache entries behind."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        request_end = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+
+        adapter.format_stream_chunk(
+            StreamChunk(text="<think>A</think>B", is_first=True, is_last=True),
+            request,
+        )
+        assert len(adapter._ended_request_payload_keys) == 1
+
+        adapter.format_stream_end(request_end)
+
+        assert adapter._ended_request_payload_keys == {}
 
     def test_format_stream_end_clears_parser_state_without_last_chunk(self, adapter):
         """format_stream_end should drop parser state even without an is_last chunk."""
