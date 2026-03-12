@@ -47,6 +47,8 @@ class OpenAIAdapter(BaseAdapter):
         self._thinking_parsers: dict[int, ThinkingParser] = {}
         self._request_payload_keys: dict[int, str] = {}
         self._active_request_keys_by_payload: dict[str, set[int]] = {}
+        self._stream_touch_seq = 0
+        self._stream_last_touched: dict[int, int] = {}
 
     @staticmethod
     def _stream_state_key(request: ChatCompletionRequest) -> int:
@@ -67,9 +69,21 @@ class OpenAIAdapter(BaseAdapter):
         self._thinking_parsers[request_key] = parser
         self._request_payload_keys[request_key] = payload_key
         self._active_request_keys_by_payload.setdefault(payload_key, set()).add(request_key)
+        self._touch_stream_key(request_key)
+
+    def _touch_stream_key(self, request_key: int) -> None:
+        self._stream_touch_seq += 1
+        self._stream_last_touched[request_key] = self._stream_touch_seq
+
+    def _allocate_collision_key(self, request_key: int) -> int:
+        candidate = request_key
+        while candidate in self._thinking_parsers or candidate in self._request_payload_keys:
+            candidate += 1
+        return candidate
 
     def _deregister_stream_key(self, request_key: int) -> None:
         self._thinking_parsers.pop(request_key, None)
+        self._stream_last_touched.pop(request_key, None)
         payload_key = self._request_payload_keys.pop(request_key, None)
         if not payload_key:
             return
@@ -86,25 +100,31 @@ class OpenAIAdapter(BaseAdapter):
         self,
         request_key: int,
         payload_key: str,
-    ) -> ThinkingParser | None:
+    ) -> tuple[ThinkingParser | None, int | None]:
         active_keys = self._active_request_keys_by_payload.get(payload_key)
         if not active_keys or len(active_keys) != 1:
-            return None
+            return None, None
 
         existing_key = next(iter(active_keys))
         parser = self._thinking_parsers.get(existing_key)
         if parser is None:
             self._deregister_stream_key(existing_key)
-            return None
+            return None, None
 
         if existing_key == request_key:
-            return parser
+            return parser, existing_key
+
+        # If request_key is already occupied by a different payload, keep the
+        # parser on its existing key to avoid cross-stream key-collision clobber.
+        occupied_payload = self._request_payload_keys.get(request_key)
+        if occupied_payload and occupied_payload != payload_key:
+            return parser, existing_key
 
         # Move ownership so a rehydrated equivalent request can continue the
         # same logical stream without object-identity coupling.
         self._deregister_stream_key(existing_key)
         self._register_stream_key(request_key, payload_key, parser)
-        return parser
+        return parser, request_key
 
     @property
     def name(self) -> str:
@@ -228,12 +248,20 @@ class OpenAIAdapter(BaseAdapter):
         extracted_thinking = ""
         transient_parser = False
         parser = self._thinking_parsers.get(request_key)
+        if parser is not None and self._request_payload_keys.get(request_key) != payload_key:
+            parser = None
         if chunk.is_first:
-            self._deregister_stream_key(request_key)
+            existing_payload = self._request_payload_keys.get(request_key)
+            if existing_payload and existing_payload != payload_key:
+                request_key = self._allocate_collision_key(request_key)
+            else:
+                self._deregister_stream_key(request_key)
             parser = ThinkingParser()
             self._register_stream_key(request_key, payload_key, parser)
         elif parser is None:
-            parser = self._adopt_equivalent_stream(request_key, payload_key)
+            parser, adopted_key = self._adopt_equivalent_stream(request_key, payload_key)
+            if adopted_key is not None:
+                request_key = adopted_key
             if parser is None:
                 parser = ThinkingParser()
                 if "<" in content or chunk.reasoning_content or chunk.is_last:
@@ -243,6 +271,8 @@ class OpenAIAdapter(BaseAdapter):
 
         if content:
             extracted_thinking, content = parser.feed(content)
+            if request_key in self._thinking_parsers:
+                self._touch_stream_key(request_key)
 
         if chunk.is_last:
             tail_thinking, tail_content = parser.finish()
@@ -302,12 +332,19 @@ class OpenAIAdapter(BaseAdapter):
             self._deregister_stream_key(request_key)
             return "data: [DONE]\n\n"
 
-        # Fallback for equivalent-object end calls: only clean up automatically
-        # when exactly one active stream matches this payload.
+        # Fallback for equivalent-object end calls. If multiple active streams
+        # share the same payload, retire the least-recently-touched one.
         payload_key = self._stream_payload_key(request)
         active_keys = self._active_request_keys_by_payload.get(payload_key)
-        if active_keys and len(active_keys) == 1:
-            self._deregister_stream_key(next(iter(active_keys)))
+        if active_keys:
+            if len(active_keys) == 1:
+                cleanup_key = next(iter(active_keys))
+            else:
+                cleanup_key = min(
+                    active_keys,
+                    key=lambda k: self._stream_last_touched.get(k, float("inf")),
+                )
+            self._deregister_stream_key(cleanup_key)
         return "data: [DONE]\n\n"
 
     def create_error_response(
