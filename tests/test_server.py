@@ -7,7 +7,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from omlx.model_settings import ModelSettings, ModelSettingsManager
-from omlx.server import SamplingDefaults, ServerState, app, get_sampling_params
+from omlx.server import (
+    SamplingDefaults,
+    ServerState,
+    _ToolCallMarkupStripper,
+    app,
+    get_sampling_params,
+)
 
 
 class TestGetSamplingParams:
@@ -142,3 +148,88 @@ class TestExceptionHandlers:
         assert response.status_code == 404
         data = response.json()
         assert "detail" in data
+
+
+class TestToolCallMarkupStripper:
+    """Focused tests for streamed tool-markup suppression."""
+
+    def test_suppresses_namespaced_tool_call_markup(self):
+        """Namespaced tool-call envelopes should not leak into visible text."""
+        stripper = _ToolCallMarkupStripper()
+
+        first = stripper.feed("Let me check ")
+        second = stripper.feed(
+            "that for you."
+            "<minimax:tool_call>"
+            "<invoke name=\"get_weather\">"
+            "<parameter name=\"city\">\"SF\"</parameter>"
+            "</invoke>"
+            "</minimax:tool_call>"
+        )
+        tail = stripper.finish()
+
+        assert first == "Let me check "
+        assert second == "that for you."
+        assert tail == ""
+        assert first + second + tail == "Let me check that for you."
+
+    def test_suppresses_namespaced_tool_call_markup_when_open_tag_is_split(self):
+        """Split namespaced open tags should buffer instead of leaking raw markup."""
+        stripper = _ToolCallMarkupStripper()
+
+        first = stripper.feed("Let me check <minimax:")
+        second = stripper.feed(
+            "tool_call>"
+            "<invoke name=\"get_weather\">"
+            "<parameter name=\"city\">\"SF\"</parameter>"
+            "</invoke>"
+            "</minimax:tool_call>"
+            " done"
+        )
+        tail = stripper.finish()
+
+        assert first == "Let me check "
+        assert second == " done"
+        assert tail == ""
+        assert first + second + tail == "Let me check  done"
+
+    def test_suppresses_namespaced_tool_call_markup_when_close_tag_is_split(self):
+        """Split namespaced close tags should not swallow trailing plain text."""
+        stripper = _ToolCallMarkupStripper()
+
+        first = stripper.feed(
+            "Let me check "
+            "<minimax:tool_call>"
+            "<invoke name=\"get_weather\">"
+            "<parameter name=\"city\">\"SF\"</parameter>"
+            "</invoke>"
+            "</mini"
+        )
+        second = stripper.feed("max:tool_call> world")
+        tail = stripper.finish()
+
+        assert first == "Let me check "
+        assert second == " world"
+        assert tail == ""
+        assert first + second + tail == "Let me check  world"
+
+    def test_suppresses_tokenizer_tool_call_markup(self):
+        """Tokenizer-defined tool delimiters should not leak into visible text."""
+
+        class MockTokenizer:
+            tool_call_start = "<|tool|>"
+            tool_call_end = "<|/tool|>"
+
+        stripper = _ToolCallMarkupStripper(MockTokenizer())
+
+        first = stripper.feed("Let me check that for you.<|to")
+        second = stripper.feed(
+            "ol|>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"SF\"}}<|/to"
+        )
+        third = stripper.feed("ol|>")
+        tail = stripper.finish()
+
+        assert first == "Let me check that for you."
+        assert second == ""
+        assert third == ""
+        assert tail == ""

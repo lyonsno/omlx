@@ -43,6 +43,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -159,6 +160,144 @@ class EngineType(Enum):
     LLM = "llm"
     EMBEDDING = "embedding"
     RERANKER = "reranker"
+
+
+_TOOL_CALL_OPEN_TAG = "<tool_call>"
+_TOOL_CALL_CLOSE_TAG = "</tool_call>"
+_NAMESPACED_TOOL_CALL_OPEN_RE = re.compile(r"<([A-Za-z_][\w.-]*):tool_call>")
+_NAMESPACED_TOOL_CALL_CLOSE_RE = re.compile(r"</[A-Za-z_][\w.-]*:tool_call>")
+
+
+class _ToolCallMarkupStripper:
+    """Stateful stripper for suppressing streamed tool-call markup.
+
+    Streaming chunks may split tags across boundaries (for example "<tool_" +
+    "call>..."), so we buffer partial tag prefixes and avoid leaking raw tool
+    call markup into assistant-visible content deltas.
+    """
+
+    def __init__(self, tokenizer=None):
+        self._in_tool_call = False
+        self._active_close_tag = ""
+        self._buffer = ""
+        self._tool_call_start = getattr(tokenizer, "tool_call_start", None)
+        self._tool_call_end = getattr(tokenizer, "tool_call_end", None)
+
+    def _fixed_tag_pairs(self) -> list[tuple[str, str]]:
+        pairs = [(_TOOL_CALL_OPEN_TAG, _TOOL_CALL_CLOSE_TAG)]
+        if self._tool_call_start and self._tool_call_end:
+            pairs.append((self._tool_call_start, self._tool_call_end))
+        return pairs
+
+    def _could_be_partial_fixed_tag(self, text: str) -> bool:
+        """Return True when text is a proper prefix of any fixed tool tag."""
+        if not text:
+            return False
+        for open_tag, close_tag in self._fixed_tag_pairs():
+            if text == open_tag or text == close_tag:
+                continue
+            if open_tag.startswith(text) or close_tag.startswith(text):
+                return True
+        return False
+
+    @staticmethod
+    def _could_be_partial_namespaced_open(text: str) -> bool:
+        """Return True when text could still become a namespaced open tag."""
+        if not text.startswith("<") or text.startswith("</") or text.endswith(">"):
+            return False
+        match = re.fullmatch(r"<([A-Za-z_][\w.-]*)(?::([\w.-]*))?", text)
+        if not match:
+            return False
+        suffix = match.group(2)
+        if suffix is None:
+            return True
+        return "tool_call".startswith(suffix)
+
+    @staticmethod
+    def _could_be_partial_specific_tag(text: str, tag: str) -> bool:
+        """Return True when text is a proper prefix of a specific known tag."""
+        return bool(text) and text != tag and tag.startswith(text)
+
+    def _detect_open_tag(self, text: str) -> tuple[str | None, int]:
+        """Return (close_tag, open_length) for a supported open marker."""
+        for open_tag, close_tag in self._fixed_tag_pairs():
+            if text.startswith(open_tag):
+                return close_tag, len(open_tag)
+
+        match = _NAMESPACED_TOOL_CALL_OPEN_RE.match(text)
+        if match:
+            namespace = match.group(1)
+            return f"</{namespace}:tool_call>", match.end()
+
+        return None, 0
+
+    def _could_be_partial_tag(self, text: str) -> bool:
+        """Return True when text could still be control markup."""
+        return self._could_be_partial_fixed_tag(text) or self._could_be_partial_namespaced_open(text)
+
+    def feed(self, text: str) -> str:
+        """Strip tool-call tag markup from this chunk, preserving plain text."""
+        if not text:
+            return ""
+
+        text = self._buffer + text
+        self._buffer = ""
+        visible: list[str] = []
+        i = 0
+
+        while i < len(text):
+            remaining = text[i:]
+
+            if self._in_tool_call:
+                if self._active_close_tag and remaining.startswith(self._active_close_tag):
+                    self._in_tool_call = False
+                    i += len(self._active_close_tag)
+                    self._active_close_tag = ""
+                    continue
+                if self._active_close_tag and self._could_be_partial_specific_tag(remaining, self._active_close_tag):
+                    self._buffer = remaining
+                    break
+                if self._could_be_partial_tag(remaining):
+                    self._buffer = remaining
+                    break
+                # Swallow tool-call payload while inside the block.
+                i += 1
+                continue
+
+            close_tag, open_len = self._detect_open_tag(remaining)
+            if close_tag is not None:
+                self._in_tool_call = True
+                self._active_close_tag = close_tag
+                i += open_len
+                continue
+
+            stripped_close_tag = False
+            for _, close_tag in self._fixed_tag_pairs():
+                if remaining.startswith(close_tag):
+                    i += len(close_tag)
+                    stripped_close_tag = True
+                    break
+            if stripped_close_tag:
+                continue
+
+            namespaced_close = _NAMESPACED_TOOL_CALL_CLOSE_RE.match(remaining)
+            if namespaced_close:
+                i += namespaced_close.end()
+                continue
+
+            if self._could_be_partial_tag(remaining):
+                self._buffer = remaining
+                break
+
+            visible.append(text[i])
+            i += 1
+
+        return "".join(visible)
+
+    def finish(self) -> str:
+        """Flush buffered tail. Partial/unclosed tool markup stays suppressed."""
+        self._buffer = ""
+        return ""
 
 
 @dataclass
@@ -1725,6 +1864,7 @@ async def stream_chat_completion(
     accumulated_text = ""
     has_tools = bool(kwargs.get("tools"))
     thinking_parser = ThinkingParser()
+    tool_markup_stripper = _ToolCallMarkupStripper(engine.tokenizer) if has_tools else None
     emitted_content_delta = False
 
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
@@ -1767,6 +1907,9 @@ async def stream_chat_completion(
 
                 # Emit content delta
                 if content_delta:
+                    if tool_markup_stripper is not None:
+                        content_delta = tool_markup_stripper.feed(content_delta)
+                if content_delta:
                     emitted_content_delta = True
                     chunk = ChatCompletionChunk(
                         id=response_id,
@@ -1804,6 +1947,9 @@ async def stream_chat_completion(
         )
         yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
     if content_delta:
+        if tool_markup_stripper is not None:
+            content_delta = tool_markup_stripper.feed(content_delta)
+    if content_delta:
         emitted_content_delta = True
         chunk = ChatCompletionChunk(
             id=response_id,
@@ -1814,6 +1960,20 @@ async def stream_chat_completion(
             )],
         )
         yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+
+    if tool_markup_stripper is not None:
+        trailing_content = tool_markup_stripper.finish()
+        if trailing_content:
+            emitted_content_delta = True
+            chunk = ChatCompletionChunk(
+                id=response_id,
+                model=request.model,
+                choices=[ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(content=trailing_content),
+                    finish_reason=None,
+                )],
+            )
+            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
     # Parse tool calls from accumulated text
     tool_calls = None
