@@ -278,7 +278,7 @@ def parse_tool_calls(
         return _parse_xml_tool_calls(cleaned_text)
 
     # Fallback: namespaced tool_call tags (e.g. <minimax:tool_call>)
-    ns_match = re.search(r'<(\w+):tool_call>', cleaned_text)
+    ns_match = re.search(r'<([A-Za-z_][\w.-]*):tool_call>', cleaned_text)
     if ns_match:
         ns = ns_match.group(1)
         return _parse_namespaced_tool_calls(cleaned_text, ns)

@@ -13,6 +13,7 @@ from omlx.api.tool_calling import (
     convert_tools_for_template,
     extract_json_from_text,
     format_tool_call_for_message,
+    parse_tool_calls,
     parse_json_output,
     validate_json_schema,
 )
@@ -143,6 +144,50 @@ class TestValidateJsonSchema:
 
         # Empty schema allows anything
         assert is_valid is True
+
+
+class TestParseToolCalls:
+    """Tests for parse_tool_calls fallback behavior."""
+
+    def test_namespaced_tool_call_with_hyphenated_namespace(self):
+        """Hyphenated namespaces should parse the same way the streamer strips them."""
+        text = (
+            "Before "
+            "<mini-max:tool_call>"
+            "<invoke name=\"get_weather\">"
+            "<parameter name=\"city\">\"SF\"</parameter>"
+            "</invoke>"
+            "</mini-max:tool_call>"
+            " after"
+        )
+
+        cleaned_text, tool_calls = parse_tool_calls(text, tokenizer=None)
+
+        assert cleaned_text == "Before  after"
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get_weather"
+        assert json.loads(tool_calls[0].function.arguments) == {"city": "SF"}
+
+    def test_namespaced_tool_call_with_dotted_namespace(self):
+        """Dotted namespaces should parse the same way the streamer strips them."""
+        text = (
+            "Before "
+            "<mini.max:tool_call>"
+            "<invoke name=\"get_weather\">"
+            "<parameter name=\"city\">\"SF\"</parameter>"
+            "</invoke>"
+            "</mini.max:tool_call>"
+            " after"
+        )
+
+        cleaned_text, tool_calls = parse_tool_calls(text, tokenizer=None)
+
+        assert cleaned_text == "Before  after"
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get_weather"
+        assert json.loads(tool_calls[0].function.arguments) == {"city": "SF"}
 
 
 class TestExtractJsonFromText:

@@ -213,6 +213,14 @@ class _ToolCallMarkupStripper:
             return True
         return "tool_call".startswith(suffix)
 
+    def _should_drop_tail_at_finish(self, text: str) -> bool:
+        """Return True only for tails that still look like tool markup."""
+        if not text:
+            return False
+        if self._could_be_partial_fixed_tag(text):
+            return True
+        return ":" in text and self._could_be_partial_namespaced_open(text)
+
     @staticmethod
     def _could_be_partial_specific_tag(text: str, tag: str) -> bool:
         """Return True when text is a proper prefix of a specific known tag."""
@@ -295,9 +303,12 @@ class _ToolCallMarkupStripper:
         return "".join(visible)
 
     def finish(self) -> str:
-        """Flush buffered tail. Partial/unclosed tool markup stays suppressed."""
+        """Flush buffered tail, preserving clearly non-tool literals."""
+        tail = ""
+        if not self._in_tool_call and not self._should_drop_tail_at_finish(self._buffer):
+            tail = self._buffer
         self._buffer = ""
-        return ""
+        return tail
 
 
 @dataclass

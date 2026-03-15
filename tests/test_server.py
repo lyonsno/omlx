@@ -233,3 +233,25 @@ class TestToolCallMarkupStripper:
         assert second == ""
         assert third == ""
         assert tail == ""
+
+    def test_suppresses_unmatched_tool_like_literal_suffix(self):
+        """Tool-like literal suffixes stay suppressed under clean-output strict."""
+        stripper = _ToolCallMarkupStripper()
+
+        first = stripper.feed("Use literal marker <tool_")
+        tail = stripper.finish()
+
+        assert first == "Use literal marker "
+        assert tail == ""
+        assert first + tail == "Use literal marker "
+
+    def test_preserves_unmatched_non_tool_literal_suffix(self):
+        """Clearly non-tool literals like <svg should survive finish()."""
+        stripper = _ToolCallMarkupStripper()
+
+        first = stripper.feed("Use literal marker <svg")
+        tail = stripper.finish()
+
+        assert first == "Use literal marker "
+        assert tail == "<svg"
+        assert first + tail == "Use literal marker <svg"
