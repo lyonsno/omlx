@@ -2714,9 +2714,18 @@ async def create_anthropic_message(
         model_id=request.model,
     )
 
-    # Separate thinking from content
+    # Separate thinking from content. Prefer explicit reasoning_content when
+    # the engine provides it, otherwise fall back to extracting from text.
     raw_text = clean_special_tokens(output.text) if output.text else ""
-    thinking_content, regular_content = extract_thinking(raw_text)
+    extracted_thinking, regular_content = extract_thinking(raw_text)
+
+    explicit_reasoning = ""
+    raw_reasoning = clean_special_tokens(output.reasoning_content) if getattr(output, "reasoning_content", None) else ""
+    if raw_reasoning:
+        tagged_reasoning, _ = extract_thinking(raw_reasoning)
+        explicit_reasoning = tagged_reasoning or raw_reasoning.strip()
+
+    thinking_content = explicit_reasoning or extracted_thinking
     cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
 
     # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser

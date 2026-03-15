@@ -7,6 +7,7 @@ to verify request/response formats without loading actual models.
 """
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock
 
@@ -799,6 +800,73 @@ class TestAnthropicMessagesEndpoint:
         assert tool_use_blocks[0]["name"] == "get_weather"
         assert tool_use_blocks[0]["input"] == {"city": "SF"}
         assert data["stop_reason"] == "tool_use"
+
+    def test_anthropic_messages_separate_reasoning_content_becomes_thinking_block(
+        self, client, mock_llm_engine
+    ):
+        """Separate reasoning content should surface as a thinking block."""
+
+        async def chat_with_reasoning(messages, **kwargs):
+            return SimpleNamespace(
+                text="Final answer",
+                reasoning_content="internal reasoning",
+                finish_reason="stop",
+                prompt_tokens=10,
+                completion_tokens=5,
+                cached_tokens=0,
+                tool_calls=None,
+            )
+
+        mock_llm_engine.chat = chat_with_reasoning
+
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["content"]) == 2
+        assert data["content"][0]["type"] == "thinking"
+        assert data["content"][0]["thinking"] == "internal reasoning"
+        assert data["content"][1]["type"] == "text"
+        assert data["content"][1]["text"] == "Final answer"
+
+    def test_anthropic_messages_implicit_close_thinking_path_still_splits_content(
+        self, client, mock_llm_engine
+    ):
+        """Implicit-close reasoning text should still split at the endpoint seam."""
+
+        async def chat_with_implicit_close(messages, **kwargs):
+            return MockGenerationOutput(
+                text="reasoning</think>Answer",
+                prompt_tokens=10,
+                completion_tokens=5,
+                finish_reason="stop",
+            )
+
+        mock_llm_engine.chat = chat_with_implicit_close
+
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["content"]) == 2
+        assert data["content"][0]["type"] == "thinking"
+        assert data["content"][0]["thinking"] == "reasoning"
+        assert data["content"][1]["type"] == "text"
+        assert data["content"][1]["text"] == "Answer"
 
 
 class TestEmbeddingsEndpoint:
