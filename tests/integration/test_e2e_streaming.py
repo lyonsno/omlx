@@ -9,6 +9,7 @@ using mock AsyncIterator without loading actual models.
 import json
 import pytest
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, AsyncIterator, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -924,7 +925,10 @@ class TestStreamingHelperFunctions:
             elif event.get("type") == "content_block_start":
                 content_block = event.get("content_block", {})
                 if content_block.get("type") == "tool_use":
-                    tool_use_blocks.append(content_block)
+                    tool_use_blocks.append({
+                        "index": event.get("index"),
+                        "name": content_block.get("name"),
+                    })
             elif event.get("type") == "message_delta":
                 stop_reason = event.get("delta", {}).get("stop_reason")
                 if stop_reason:
@@ -937,6 +941,132 @@ class TestStreamingHelperFunctions:
         assert "Then continue." in streamed_thinking
         assert len(tool_use_blocks) == 1
         assert tool_use_blocks[0]["name"] == "get_weather"
+        assert "tool_use" in stop_reasons
+
+    # Streaming contract for separate reasoning:
+    # - `reasoning_content` is cumulative, mirroring `text`.
+    # - The server must emit deduplicated thinking deltas from it.
+    # - Tool-call markup in that channel must still become `tool_use`.
+    @pytest.mark.asyncio
+    async def test_stream_anthropic_messages_recovers_tool_call_from_reasoning_content(self):
+        """Streaming Anthropic path should use reasoning_content for thinking and tool recovery."""
+        from omlx.server import stream_anthropic_messages
+        from omlx.api.anthropic_models import MessagesRequest
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            SimpleNamespace(
+                text="Final",
+                new_text="Final",
+                completion_tokens=1,
+                finished=False,
+                finish_reason=None,
+                prompt_tokens=10,
+                cached_tokens=0,
+                tool_calls=None,
+                reasoning_content=(
+                    '<tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call>'
+                    "internal "
+                ),
+            ),
+            SimpleNamespace(
+                text="Final answer",
+                new_text=" answer",
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+                prompt_tokens=10,
+                cached_tokens=0,
+                tool_calls=None,
+                reasoning_content=(
+                    '<tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call>'
+                    "internal reasoning"
+                ),
+            ),
+        ])
+
+        anthropic_tools = [{
+            "name": "get_weather",
+            "description": "Get weather",
+            "input_schema": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        }]
+        internal_tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }]
+
+        request = MessagesRequest(
+            model="test-model",
+            max_tokens=256,
+            messages=[{"role": "user", "content": "Hi"}],
+            stream=True,
+            tools=anthropic_tools,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_anthropic_messages(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=internal_tools,
+        ):
+            events.append(event)
+
+        parsed_events = []
+        for event in events:
+            for line in event.split("\n"):
+                if line.startswith("data: "):
+                    try:
+                        parsed_events.append(json.loads(line[6:]))
+                    except json.JSONDecodeError:
+                        pass
+
+        thinking_deltas = []
+        text_deltas = []
+        tool_use_blocks = []
+        tool_use_inputs = {}
+        stop_reasons = []
+        for event in parsed_events:
+            if event.get("type") == "content_block_delta":
+                delta = event.get("delta", {})
+                if delta.get("type") == "thinking_delta":
+                    thinking_deltas.append(delta["thinking"])
+                if delta.get("type") == "text_delta":
+                    text_deltas.append(delta["text"])
+                if delta.get("type") == "input_json_delta":
+                    index = event.get("index")
+                    tool_use_inputs[index] = tool_use_inputs.get(index, "") + delta["partial_json"]
+            elif event.get("type") == "content_block_start":
+                content_block = event.get("content_block", {})
+                if content_block.get("type") == "tool_use":
+                    tool_use_blocks.append(content_block)
+            elif event.get("type") == "message_delta":
+                stop_reason = event.get("delta", {}).get("stop_reason")
+                if stop_reason:
+                    stop_reasons.append(stop_reason)
+
+        assert "".join(thinking_deltas) == "internal reasoning"
+        assert "".join(text_deltas) == "Final answer"
+        assert len(tool_use_blocks) == 1
+        assert tool_use_blocks[0]["name"] == "get_weather"
+        assert json.loads(tool_use_inputs[tool_use_blocks[0]["index"]]) == {"city": "SF"}
         assert "tool_use" in stop_reasons
 
     @pytest.mark.asyncio

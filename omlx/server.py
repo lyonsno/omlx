@@ -2258,6 +2258,54 @@ async def stream_chat_completion(
 # =============================================================================
 
 
+def _anthropic_reasoning_sources(
+    text: str | None,
+    reasoning_content: str | None,
+) -> tuple[str, str, str]:
+    """Resolve visible thinking, tool-recovery thinking, and visible text."""
+    raw_text = clean_special_tokens(text) if text else ""
+    text_thinking, text_content = extract_thinking(raw_text)
+
+    explicit_reasoning = ""
+    reasoning_tool_source = ""
+    reasoning_text_suffix = ""
+
+    raw_reasoning = clean_special_tokens(reasoning_content) if reasoning_content else ""
+    if raw_reasoning:
+        raw_reasoning = raw_reasoning.strip()
+        tagged_reasoning, tagged_suffix = extract_thinking(raw_reasoning)
+        has_reasoning_tags = "<think>" in raw_reasoning or "</think>" in raw_reasoning
+        if has_reasoning_tags:
+            explicit_reasoning = tagged_reasoning.strip()
+            reasoning_tool_source = tagged_reasoning
+            reasoning_text_suffix = tagged_suffix
+        else:
+            explicit_reasoning = raw_reasoning
+            reasoning_tool_source = raw_reasoning
+
+    display_thinking = explicit_reasoning or text_thinking
+
+    tool_recovery_parts = []
+    if text_thinking:
+        tool_recovery_parts.append(text_thinking)
+    if reasoning_tool_source and reasoning_tool_source not in tool_recovery_parts:
+        tool_recovery_parts.append(reasoning_tool_source)
+    tool_recovery_thinking = "\n".join(tool_recovery_parts).strip()
+
+    visible_text = text_content or reasoning_text_suffix
+
+    return display_thinking, tool_recovery_thinking, visible_text
+
+
+def _incremental_suffix(previous: str, current: str) -> str:
+    """Return the appended suffix when `current` extends `previous`."""
+    if not current:
+        return ""
+    if current.startswith(previous):
+        return current[len(previous):]
+    return current
+
+
 async def stream_anthropic_messages(
     engine: BaseEngine,
     messages: list,
@@ -2288,6 +2336,9 @@ async def stream_anthropic_messages(
 
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
     accumulated_text = ""
+    last_reasoning_display = ""
+    last_visible_content = ""
+    separate_reasoning_seen = False
 
     # Track content blocks with thinking separation
     thinking_parser = ThinkingParser()
@@ -2337,44 +2388,66 @@ async def stream_anthropic_messages(
         async for output in engine.stream_chat(messages=messages, **kwargs):
             last_output = output  # Keep reference for tool_calls and token counts
 
-            if first_token_time is None and output.new_text:
+            if first_token_time is None and (
+                output.new_text or getattr(output, "reasoning_content", None)
+            ):
                 first_token_time = time.perf_counter()
 
+            thinking_delta = ""
+            content_delta = ""
             if output.new_text:
                 accumulated_text += output.new_text
+
+            if getattr(output, "reasoning_content", None) is not None:
+                separate_reasoning_seen = True
+                display_thinking, _, visible_text = _anthropic_reasoning_sources(
+                    output.text,
+                    output.reasoning_content,
+                )
+                current_reasoning_display = sanitize_tool_call_markup(
+                    display_thinking,
+                    engine.tokenizer,
+                )
+                thinking_delta = _incremental_suffix(
+                    last_reasoning_display, current_reasoning_display
+                )
+                content_delta = _incremental_suffix(last_visible_content, visible_text)
+                last_reasoning_display = current_reasoning_display
+                last_visible_content = visible_text
+            elif output.new_text:
                 thinking_delta, content_delta = thinking_parser.feed(output.new_text)
 
-                # Emit thinking content as thinking block
-                if thinking_delta:
-                    if thinking_filter:
-                        thinking_delta = thinking_filter.feed(thinking_delta)
-                    if not thinking_block_started:
-                        if thinking_delta:
-                            yield create_content_block_start_event(
-                                index=block_index, block_type="thinking"
-                            )
-                            thinking_block_started = True
+            # Emit thinking content as thinking block
+            if thinking_delta:
+                if thinking_filter:
+                    thinking_delta = thinking_filter.feed(thinking_delta)
+                if not thinking_block_started:
                     if thinking_delta:
-                        yield create_thinking_delta_event(
-                            index=block_index, thinking=thinking_delta
+                        yield create_content_block_start_event(
+                            index=block_index, block_type="thinking"
                         )
+                        thinking_block_started = True
+                if thinking_delta:
+                    yield create_thinking_delta_event(
+                        index=block_index, thinking=thinking_delta
+                    )
 
-                # Emit regular content as text block — filter tool-call
-                # markup when a known start marker is available.
+            # Emit regular content as text block — filter tool-call
+            # markup when a known start marker is available.
+            if content_delta:
+                if tool_filter:
+                    content_delta = tool_filter.feed(content_delta)
                 if content_delta:
-                    if tool_filter:
-                        content_delta = tool_filter.feed(content_delta)
-                    if content_delta:
-                        # Close thinking block if transitioning to text
-                        if thinking_block_started and not text_block_started:
-                            yield create_content_block_stop_event(index=block_index)
-                            block_index += 1
-                        if not text_block_started:
-                            yield create_content_block_start_event(
-                                index=block_index, block_type="text"
-                            )
-                            text_block_started = True
-                        yield create_text_delta_event(index=block_index, text=content_delta)
+                    # Close thinking block if transitioning to text
+                    if thinking_block_started and not text_block_started:
+                        yield create_content_block_stop_event(index=block_index)
+                        block_index += 1
+                    if not text_block_started:
+                        yield create_content_block_start_event(
+                            index=block_index, block_type="text"
+                        )
+                        text_block_started = True
+                    yield create_text_delta_event(index=block_index, text=content_delta)
 
             if output.finished:
                 break
@@ -2385,7 +2458,10 @@ async def stream_anthropic_messages(
         return
 
     # Flush remaining buffered content from thinking parser
-    thinking_delta, content_delta = thinking_parser.finish()
+    thinking_delta = ""
+    content_delta = ""
+    if not separate_reasoning_seen:
+        thinking_delta, content_delta = thinking_parser.finish()
     if thinking_delta:
         if thinking_filter:
             thinking_delta = thinking_filter.feed(thinking_delta)
@@ -2466,9 +2542,15 @@ async def stream_anthropic_messages(
             for tc in last_output.tool_calls
         ]
     elif kwargs.get("tools"):
-        # Non-Harmony: separate thinking, then parse tool calls from content
-        # (falls back to thinking content for small models)
-        thinking_content, regular_content = extract_thinking(accumulated_text)
+        # Non-Harmony: parse tool calls from visible content, falling back to
+        # thinking extracted from either output.text or reasoning_content.
+        if last_output:
+            _, thinking_content, regular_content = _anthropic_reasoning_sources(
+                last_output.text,
+                getattr(last_output, "reasoning_content", None),
+            )
+        else:
+            thinking_content, regular_content = extract_thinking(accumulated_text)
         extraction = extract_tool_calls_with_thinking(
             thinking_content,
             regular_content,
@@ -2714,28 +2796,12 @@ async def create_anthropic_message(
         model_id=request.model,
     )
 
-    # Separate thinking from content. Prefer explicit reasoning_content for the
-    # visible Anthropic thinking block when the engine provides it, but keep
-    # tool-call recovery anchored to thinking extracted from output.text.
-    raw_text = clean_special_tokens(output.text) if output.text else ""
-    extracted_thinking, regular_content = extract_thinking(raw_text)
-
-    explicit_reasoning = ""
-    raw_reasoning = (
-        clean_special_tokens(output.reasoning_content)
-        if getattr(output, "reasoning_content", None)
-        else ""
+    # Resolve visible thinking/text and the reasoning source used for
+    # fallback tool recovery.
+    display_thinking, tool_recovery_thinking, regular_content = _anthropic_reasoning_sources(
+        output.text,
+        getattr(output, "reasoning_content", None),
     )
-    if raw_reasoning:
-        raw_reasoning = raw_reasoning.strip()
-        tagged_reasoning, _ = extract_thinking(raw_reasoning)
-        has_reasoning_tags = "<think>" in raw_reasoning or "</think>" in raw_reasoning
-        if has_reasoning_tags:
-            explicit_reasoning = tagged_reasoning.strip()
-        else:
-            explicit_reasoning = raw_reasoning
-
-    display_thinking = explicit_reasoning or extracted_thinking
     cleaned_thinking = sanitize_tool_call_markup(display_thinking, engine.tokenizer)
 
     # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
@@ -2757,18 +2823,17 @@ async def create_anthropic_message(
         cleaned_text = regular_content
     else:
         # Parse tool calls from regular content, falling back to thinking
-        # extracted from output.text for small models that emit tool calls
-        # inside <think> blocks.
+        # extracted from text and/or reasoning_content for small models.
         extraction = extract_tool_calls_with_thinking(
-            extracted_thinking,
+            tool_recovery_thinking,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=internal_tools,
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
-        if explicit_reasoning:
-            cleaned_thinking = sanitize_tool_call_markup(explicit_reasoning, engine.tokenizer)
+        if display_thinking:
+            cleaned_thinking = sanitize_tool_call_markup(display_thinking, engine.tokenizer)
         else:
             cleaned_thinking = extraction.cleaned_thinking
 
