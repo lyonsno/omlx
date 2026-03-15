@@ -2714,19 +2714,29 @@ async def create_anthropic_message(
         model_id=request.model,
     )
 
-    # Separate thinking from content. Prefer explicit reasoning_content when
-    # the engine provides it, otherwise fall back to extracting from text.
+    # Separate thinking from content. Prefer explicit reasoning_content for the
+    # visible Anthropic thinking block when the engine provides it, but keep
+    # tool-call recovery anchored to thinking extracted from output.text.
     raw_text = clean_special_tokens(output.text) if output.text else ""
     extracted_thinking, regular_content = extract_thinking(raw_text)
 
     explicit_reasoning = ""
-    raw_reasoning = clean_special_tokens(output.reasoning_content) if getattr(output, "reasoning_content", None) else ""
+    raw_reasoning = (
+        clean_special_tokens(output.reasoning_content)
+        if getattr(output, "reasoning_content", None)
+        else ""
+    )
     if raw_reasoning:
+        raw_reasoning = raw_reasoning.strip()
         tagged_reasoning, _ = extract_thinking(raw_reasoning)
-        explicit_reasoning = tagged_reasoning or raw_reasoning.strip()
+        has_reasoning_tags = "<think>" in raw_reasoning or "</think>" in raw_reasoning
+        if has_reasoning_tags:
+            explicit_reasoning = tagged_reasoning.strip()
+        else:
+            explicit_reasoning = raw_reasoning
 
-    thinking_content = explicit_reasoning or extracted_thinking
-    cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
+    display_thinking = explicit_reasoning or extracted_thinking
+    cleaned_thinking = sanitize_tool_call_markup(display_thinking, engine.tokenizer)
 
     # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
     # For other models, parse from text output
@@ -2747,16 +2757,20 @@ async def create_anthropic_message(
         cleaned_text = regular_content
     else:
         # Parse tool calls from regular content, falling back to thinking
-        # content for small models that emit tool calls inside <think> blocks
+        # extracted from output.text for small models that emit tool calls
+        # inside <think> blocks.
         extraction = extract_tool_calls_with_thinking(
-            thinking_content,
+            extracted_thinking,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=internal_tools,
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
-        cleaned_thinking = extraction.cleaned_thinking
+        if explicit_reasoning:
+            cleaned_thinking = sanitize_tool_call_markup(explicit_reasoning, engine.tokenizer)
+        else:
+            cleaned_thinking = extraction.cleaned_thinking
 
     # Convert to Anthropic response format
     response = convert_internal_to_anthropic_response(

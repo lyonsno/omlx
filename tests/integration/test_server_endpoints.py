@@ -836,6 +836,96 @@ class TestAnthropicMessagesEndpoint:
         assert data["content"][1]["type"] == "text"
         assert data["content"][1]["text"] == "Final answer"
 
+    def test_anthropic_messages_explicit_reasoning_does_not_block_tool_recovery(
+        self, client, mock_llm_engine
+    ):
+        """Explicit reasoning_content should not prevent tool recovery from text thinking blocks."""
+
+        async def chat_with_reasoning_and_think_tool_call(messages, **kwargs):
+            return SimpleNamespace(
+                text=(
+                    '<think><tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call></think>'
+                    "Final answer"
+                ),
+                reasoning_content="internal reasoning",
+                finish_reason="stop",
+                prompt_tokens=10,
+                completion_tokens=5,
+                cached_tokens=0,
+                tool_calls=None,
+            )
+
+        mock_llm_engine.chat = chat_with_reasoning_and_think_tool_call
+
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "tools": [{
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                }],
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        thinking_blocks = [block for block in data["content"] if block["type"] == "thinking"]
+        text_blocks = [block for block in data["content"] if block["type"] == "text"]
+        tool_use_blocks = [block for block in data["content"] if block["type"] == "tool_use"]
+
+        assert len(thinking_blocks) == 1
+        assert thinking_blocks[0]["thinking"] == "internal reasoning"
+        assert len(text_blocks) == 1
+        assert text_blocks[0]["text"] == "Final answer"
+        assert len(tool_use_blocks) == 1
+        assert tool_use_blocks[0]["name"] == "get_weather"
+        assert tool_use_blocks[0]["input"] == {"city": "SF"}
+        assert data["stop_reason"] == "tool_use"
+
+    def test_anthropic_messages_empty_tagged_reasoning_content_does_not_leak_tags(
+        self, client, mock_llm_engine
+    ):
+        """Empty tagged reasoning_content should not leak raw think tags or duplicate answer text."""
+
+        async def chat_with_empty_tagged_reasoning(messages, **kwargs):
+            return SimpleNamespace(
+                text="Visible answer",
+                reasoning_content="<think></think>Answer",
+                finish_reason="stop",
+                prompt_tokens=10,
+                completion_tokens=5,
+                cached_tokens=0,
+                tool_calls=None,
+            )
+
+        mock_llm_engine.chat = chat_with_empty_tagged_reasoning
+
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        thinking_blocks = [block for block in data["content"] if block["type"] == "thinking"]
+        text_blocks = [block for block in data["content"] if block["type"] == "text"]
+
+        assert thinking_blocks == []
+        assert len(text_blocks) == 1
+        assert text_blocks[0]["text"] == "Visible answer"
+
     def test_anthropic_messages_implicit_close_thinking_path_still_splits_content(
         self, client, mock_llm_engine
     ):
