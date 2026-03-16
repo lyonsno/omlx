@@ -191,7 +191,10 @@ class TestToolCallMarkupStripper:
         assert first == "Let me check "
         assert second == " done"
         assert tail == ""
-        assert first + second + tail == "Let me check  done"
+        visible = first + second + tail
+        assert visible.startswith("Let me check ")
+        assert visible.endswith(" done")
+        assert "<minimax:tool_call>" not in visible
 
     def test_suppresses_namespaced_tool_call_markup_when_close_tag_is_split(self):
         """Split namespaced close tags should not swallow trailing plain text."""
@@ -211,7 +214,10 @@ class TestToolCallMarkupStripper:
         assert first == "Let me check "
         assert second == " world"
         assert tail == ""
-        assert first + second + tail == "Let me check  world"
+        visible = first + second + tail
+        assert visible.startswith("Let me check ")
+        assert visible.endswith(" world")
+        assert "</minimax:tool_call>" not in visible
 
     def test_suppresses_tokenizer_tool_call_markup(self):
         """Tokenizer-defined tool delimiters should not leak into visible text."""
@@ -255,3 +261,25 @@ class TestToolCallMarkupStripper:
         assert first == "Use literal marker "
         assert tail == "<svg"
         assert first + tail == "Use literal marker <svg"
+
+    def test_preserves_unmatched_non_tool_namespaced_literal_suffix(self):
+        """Clearly non-tool literals like <svg: should survive finish()."""
+        stripper = _ToolCallMarkupStripper()
+
+        first = stripper.feed("Use literal marker <svg:")
+        tail = stripper.finish()
+
+        assert first == "Use literal marker "
+        assert tail == "<svg:"
+        assert first + tail == "Use literal marker <svg:"
+
+    def test_preserves_generic_namespaced_literal_suffix(self):
+        """Generic namespace-looking literals like <ns: should not be dropped."""
+        stripper = _ToolCallMarkupStripper()
+
+        first = stripper.feed("Use literal marker <ns:")
+        tail = stripper.finish()
+
+        assert first == "Use literal marker "
+        assert tail == "<ns:"
+        assert first + tail == "Use literal marker <ns:"

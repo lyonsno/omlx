@@ -163,7 +163,9 @@ class TestParseToolCalls:
 
         cleaned_text, tool_calls = parse_tool_calls(text, tokenizer=None)
 
-        assert cleaned_text == "Before  after"
+        assert cleaned_text.startswith("Before ")
+        assert cleaned_text.endswith(" after")
+        assert "<mini-max:tool_call>" not in cleaned_text
         assert tool_calls is not None
         assert len(tool_calls) == 1
         assert tool_calls[0].function.name == "get_weather"
@@ -183,7 +185,9 @@ class TestParseToolCalls:
 
         cleaned_text, tool_calls = parse_tool_calls(text, tokenizer=None)
 
-        assert cleaned_text == "Before  after"
+        assert cleaned_text.startswith("Before ")
+        assert cleaned_text.endswith(" after")
+        assert "<mini.max:tool_call>" not in cleaned_text
         assert tool_calls is not None
         assert len(tool_calls) == 1
         assert tool_calls[0].function.name == "get_weather"

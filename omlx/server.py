@@ -219,7 +219,14 @@ class _ToolCallMarkupStripper:
             return False
         if self._could_be_partial_fixed_tag(text):
             return True
-        return ":" in text and self._could_be_partial_namespaced_open(text)
+        if ":" not in text or not self._could_be_partial_namespaced_open(text):
+            return False
+        match = re.fullmatch(r"<([A-Za-z_][\w.-]*):([\w.-]*)", text)
+        if not match:
+            return False
+        # Preserve bare namespace tails like "<svg:" at EOF. Only suppress
+        # once the suffix has actually started to become "tool_call".
+        return bool(match.group(2))
 
     @staticmethod
     def _could_be_partial_specific_tag(text: str, tag: str) -> bool:
