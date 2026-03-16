@@ -1056,7 +1056,10 @@ class TestStreamingHelperFunctions:
             elif event.get("type") == "content_block_start":
                 content_block = event.get("content_block", {})
                 if content_block.get("type") == "tool_use":
-                    tool_use_blocks.append(content_block)
+                    tool_use_blocks.append({
+                        "index": event.get("index"),
+                        "name": content_block.get("name"),
+                    })
             elif event.get("type") == "message_delta":
                 stop_reason = event.get("delta", {}).get("stop_reason")
                 if stop_reason:
@@ -1068,6 +1071,81 @@ class TestStreamingHelperFunctions:
         assert tool_use_blocks[0]["name"] == "get_weather"
         assert json.loads(tool_use_inputs[tool_use_blocks[0]["index"]]) == {"city": "SF"}
         assert "tool_use" in stop_reasons
+
+    @pytest.mark.asyncio
+    async def test_stream_anthropic_messages_handoff_to_reasoning_content_does_not_duplicate_text(self):
+        """Switching from plain text chunks to reasoning_content must not duplicate emitted text."""
+        from omlx.server import stream_anthropic_messages
+        from omlx.api.anthropic_models import MessagesRequest
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            SimpleNamespace(
+                text="Final",
+                new_text="Final",
+                completion_tokens=1,
+                finished=False,
+                finish_reason=None,
+                prompt_tokens=10,
+                cached_tokens=0,
+                tool_calls=None,
+                reasoning_content=None,
+            ),
+            SimpleNamespace(
+                text="Final answer",
+                new_text=" answer",
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+                prompt_tokens=10,
+                cached_tokens=0,
+                tool_calls=None,
+                reasoning_content="<think>internal reasoning</think>Final answer",
+            ),
+        ])
+
+        request = MessagesRequest(
+            model="test-model",
+            max_tokens=256,
+            messages=[{"role": "user", "content": "Hi"}],
+            stream=True,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_anthropic_messages(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+        ):
+            events.append(event)
+
+        parsed_events = []
+        for event in events:
+            for line in event.split("\n"):
+                if line.startswith("data: "):
+                    try:
+                        parsed_events.append(json.loads(line[6:]))
+                    except json.JSONDecodeError:
+                        pass
+
+        thinking_deltas = []
+        text_deltas = []
+        for event in parsed_events:
+            if event.get("type") != "content_block_delta":
+                continue
+            delta = event.get("delta", {})
+            if delta.get("type") == "thinking_delta":
+                thinking_deltas.append(delta["thinking"])
+            if delta.get("type") == "text_delta":
+                text_deltas.append(delta["text"])
+
+        assert "".join(thinking_deltas) == "internal reasoning"
+        assert "".join(text_deltas) == "Final answer"
 
     @pytest.mark.asyncio
     async def test_stream_chat_completion_with_tools_and_tool_calls_keeps_prior_content(self):

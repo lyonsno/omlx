@@ -2292,7 +2292,11 @@ def _anthropic_reasoning_sources(
         tool_recovery_parts.append(reasoning_tool_source)
     tool_recovery_thinking = "\n".join(tool_recovery_parts).strip()
 
-    visible_text = text_content or reasoning_text_suffix
+    visible_text = text_content
+    if reasoning_text_suffix and (
+        not visible_text or reasoning_text_suffix.startswith(visible_text)
+    ):
+        visible_text = reasoning_text_suffix
 
     return display_thinking, tool_recovery_thinking, visible_text
 
@@ -2422,6 +2426,10 @@ async def stream_anthropic_messages(
                 if thinking_filter:
                     thinking_delta = thinking_filter.feed(thinking_delta)
                 if not thinking_block_started:
+                    if text_block_started:
+                        yield create_content_block_stop_event(index=block_index)
+                        block_index += 1
+                        text_block_started = False
                     if thinking_delta:
                         yield create_content_block_start_event(
                             index=block_index, block_type="thinking"
@@ -2431,6 +2439,7 @@ async def stream_anthropic_messages(
                     yield create_thinking_delta_event(
                         index=block_index, thinking=thinking_delta
                     )
+                    last_reasoning_display += thinking_delta
 
             # Emit regular content as text block — filter tool-call
             # markup when a known start marker is available.
@@ -2442,12 +2451,14 @@ async def stream_anthropic_messages(
                     if thinking_block_started and not text_block_started:
                         yield create_content_block_stop_event(index=block_index)
                         block_index += 1
+                        thinking_block_started = False
                     if not text_block_started:
                         yield create_content_block_start_event(
                             index=block_index, block_type="text"
                         )
                         text_block_started = True
                     yield create_text_delta_event(index=block_index, text=content_delta)
+                    last_visible_content += content_delta
 
             if output.finished:
                 break
@@ -2467,15 +2478,24 @@ async def stream_anthropic_messages(
             thinking_delta = thinking_filter.feed(thinking_delta)
         if thinking_delta:
             if not thinking_block_started:
+                if text_block_started:
+                    yield create_content_block_stop_event(index=block_index)
+                    block_index += 1
+                    text_block_started = False
                 yield create_content_block_start_event(
                     index=block_index, block_type="thinking"
                 )
                 thinking_block_started = True
             yield create_thinking_delta_event(index=block_index, thinking=thinking_delta)
+            last_reasoning_display += thinking_delta
     if thinking_filter:
         remaining_thinking = thinking_filter.finish()
         if remaining_thinking:
             if not thinking_block_started:
+                if text_block_started:
+                    yield create_content_block_stop_event(index=block_index)
+                    block_index += 1
+                    text_block_started = False
                 yield create_content_block_start_event(
                     index=block_index, block_type="thinking"
                 )
@@ -2483,6 +2503,7 @@ async def stream_anthropic_messages(
             yield create_thinking_delta_event(
                 index=block_index, thinking=remaining_thinking
             )
+            last_reasoning_display += remaining_thinking
     if content_delta:
         if tool_filter:
             content_delta = tool_filter.feed(content_delta)
@@ -2490,12 +2511,14 @@ async def stream_anthropic_messages(
             if thinking_block_started and not text_block_started:
                 yield create_content_block_stop_event(index=block_index)
                 block_index += 1
+                thinking_block_started = False
             if not text_block_started:
                 yield create_content_block_start_event(
                     index=block_index, block_type="text"
                 )
                 text_block_started = True
             yield create_text_delta_event(index=block_index, text=content_delta)
+            last_visible_content += content_delta
 
     # Flush any remaining buffered content from the tool-call filter
     if tool_filter:

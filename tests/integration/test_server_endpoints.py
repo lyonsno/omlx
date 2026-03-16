@@ -1080,6 +1080,43 @@ class TestAnthropicMessagesEndpoint:
         assert len(text_blocks) == 1
         assert text_blocks[0]["text"] == "Final answer"
 
+    def test_anthropic_messages_prefers_more_complete_reasoning_suffix_over_partial_text(
+        self, client, mock_llm_engine
+    ):
+        """Tagged reasoning suffix should complete visible text when text is only a partial prefix."""
+
+        async def chat_with_partial_text_and_reasoning_suffix(messages, **kwargs):
+            return SimpleNamespace(
+                text="Final",
+                reasoning_content="<think>internal reasoning</think>Final answer",
+                finish_reason="stop",
+                prompt_tokens=10,
+                completion_tokens=5,
+                cached_tokens=0,
+                tool_calls=None,
+            )
+
+        mock_llm_engine.chat = chat_with_partial_text_and_reasoning_suffix
+
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        thinking_blocks = [block for block in data["content"] if block["type"] == "thinking"]
+        text_blocks = [block for block in data["content"] if block["type"] == "text"]
+
+        assert len(thinking_blocks) == 1
+        assert thinking_blocks[0]["thinking"] == "internal reasoning"
+        assert len(text_blocks) == 1
+        assert text_blocks[0]["text"] == "Final answer"
+
     def test_anthropic_messages_implicit_close_thinking_path_still_splits_content(
         self, client, mock_llm_engine
     ):
