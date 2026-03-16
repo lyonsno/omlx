@@ -943,6 +943,147 @@ class TestStreamingHelperFunctions:
         assert tool_use_blocks[0]["name"] == "get_weather"
         assert "tool_use" in stop_reasons
 
+    @pytest.mark.asyncio
+    async def test_stream_anthropic_messages_tool_only_reasoning_content_does_not_suppress_text_thinking(self):
+        """Tool-call-only reasoning_content should not blank richer thinking recovered from text."""
+        from omlx.server import stream_anthropic_messages
+        from omlx.api.anthropic_models import MessagesRequest
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            SimpleNamespace(
+                text="<think>Need to inspect first.",
+                new_text="<think>Need to inspect first.",
+                completion_tokens=1,
+                finished=False,
+                finish_reason=None,
+                prompt_tokens=10,
+                cached_tokens=0,
+                tool_calls=None,
+                reasoning_content=(
+                    '<tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call>'
+                ),
+            ),
+            SimpleNamespace(
+                text=(
+                    "<think>Need to inspect first."
+                    '<tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call>'
+                    "Then continue.</think>Final answer"
+                ),
+                new_text=(
+                    '<tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call>'
+                    "Then continue.</think>Final answer"
+                ),
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+                prompt_tokens=10,
+                cached_tokens=0,
+                tool_calls=None,
+                reasoning_content=(
+                    '<tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call>'
+                ),
+            ),
+        ])
+
+        anthropic_tools = [{
+            "name": "get_weather",
+            "description": "Get weather",
+            "input_schema": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        }]
+        internal_tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }]
+
+        request = MessagesRequest(
+            model="test-model",
+            max_tokens=256,
+            messages=[{"role": "user", "content": "Hi"}],
+            stream=True,
+            tools=anthropic_tools,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_anthropic_messages(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=internal_tools,
+        ):
+            events.append(event)
+
+        parsed_events = []
+        for event in events:
+            for line in event.split("\n"):
+                if line.startswith("data: "):
+                    try:
+                        parsed_events.append(json.loads(line[6:]))
+                    except json.JSONDecodeError:
+                        pass
+
+        thinking_deltas = []
+        text_deltas = []
+        block_events = []
+        tool_use_blocks = []
+        tool_use_inputs = {}
+        stop_reasons = []
+        for event in parsed_events:
+            if event.get("type") == "content_block_delta":
+                delta = event.get("delta", {})
+                if delta.get("type") == "thinking_delta":
+                    thinking_deltas.append(delta["thinking"])
+                if delta.get("type") == "text_delta":
+                    text_deltas.append(delta["text"])
+                if delta.get("type") == "input_json_delta":
+                    index = event.get("index")
+                    tool_use_inputs[index] = tool_use_inputs.get(index, "") + delta["partial_json"]
+            elif event.get("type") == "content_block_start":
+                content_block = event.get("content_block", {})
+                block_events.append(
+                    ("start", event.get("index"), content_block.get("type"))
+                )
+                if content_block.get("type") == "tool_use":
+                    tool_use_blocks.append({
+                        "index": event.get("index"),
+                        "name": content_block.get("name"),
+                    })
+            elif event.get("type") == "content_block_stop":
+                block_events.append(("stop", event.get("index"), None))
+            elif event.get("type") == "message_delta":
+                stop_reason = event.get("delta", {}).get("stop_reason")
+                if stop_reason:
+                    stop_reasons.append(stop_reason)
+
+        assert "".join(thinking_deltas) == "Need to inspect first.Then continue."
+        assert "".join(text_deltas) == "Final answer"
+        assert [event for event in block_events if event[0] == "start"] == [
+            ("start", 0, "thinking"),
+            ("start", 1, "text"),
+            ("start", 2, "tool_use"),
+        ]
+        assert len(tool_use_blocks) == 1
+        assert tool_use_blocks[0]["name"] == "get_weather"
+        assert json.loads(tool_use_inputs[tool_use_blocks[0]["index"]]) == {"city": "SF"}
+        assert "tool_use" in stop_reasons
+
     # Streaming contract for separate reasoning:
     # - `reasoning_content` is cumulative, mirroring `text`.
     # - The server must emit deduplicated thinking deltas from it.
@@ -1073,6 +1214,117 @@ class TestStreamingHelperFunctions:
         assert "tool_use" in stop_reasons
 
     @pytest.mark.asyncio
+    async def test_stream_anthropic_messages_reasoning_content_stays_incremental_across_multiple_chunks(self):
+        """Later reasoning_content chunks should emit only true suffixes, not replay cumulative content."""
+        from omlx.server import stream_anthropic_messages
+        from omlx.api.anthropic_models import MessagesRequest
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            SimpleNamespace(
+                text="Final",
+                new_text="Final",
+                completion_tokens=1,
+                finished=False,
+                finish_reason=None,
+                prompt_tokens=10,
+                cached_tokens=0,
+                tool_calls=None,
+                reasoning_content=None,
+            ),
+            SimpleNamespace(
+                text="Final answer",
+                new_text=" answer",
+                completion_tokens=2,
+                finished=False,
+                finish_reason=None,
+                prompt_tokens=10,
+                cached_tokens=0,
+                tool_calls=None,
+                reasoning_content="<think>internal reasoning</think>Final answer",
+            ),
+            SimpleNamespace(
+                text="Final answer now",
+                new_text=" now",
+                completion_tokens=3,
+                finished=True,
+                finish_reason="stop",
+                prompt_tokens=10,
+                cached_tokens=0,
+                tool_calls=None,
+                reasoning_content="<think>internal reasoning</think>Final answer now",
+            ),
+        ])
+
+        request = MessagesRequest(
+            model="test-model",
+            max_tokens=256,
+            messages=[{"role": "user", "content": "Hi"}],
+            stream=True,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_anthropic_messages(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+        ):
+            events.append(event)
+
+        parsed_events = []
+        for event in events:
+            for line in event.split("\n"):
+                if line.startswith("data: "):
+                    try:
+                        parsed_events.append(json.loads(line[6:]))
+                    except json.JSONDecodeError:
+                        pass
+
+        thinking_deltas = []
+        text_deltas = []
+        content_deltas = []
+        block_events = []
+        for event in parsed_events:
+            if event.get("type") == "content_block_delta":
+                delta = event.get("delta", {})
+                if delta.get("type") == "thinking_delta":
+                    thinking_deltas.append(delta["thinking"])
+                    content_deltas.append(
+                        ("thinking", event.get("index"), delta["thinking"])
+                    )
+                if delta.get("type") == "text_delta":
+                    text_deltas.append(delta["text"])
+                    content_deltas.append(("text", event.get("index"), delta["text"]))
+            elif event.get("type") == "content_block_start":
+                block_events.append(
+                    ("start", event.get("index"), event.get("content_block", {}).get("type"))
+                )
+            elif event.get("type") == "content_block_stop":
+                block_events.append(("stop", event.get("index"), None))
+
+        assert "".join(thinking_deltas) == "internal reasoning"
+        assert "".join(text_deltas) == "Final answer now"
+        assert block_events == [
+            ("start", 0, "text"),
+            ("stop", 0, None),
+            ("start", 1, "thinking"),
+            ("stop", 1, None),
+            ("start", 2, "text"),
+            ("stop", 2, None),
+        ]
+        assert content_deltas == [
+            ("text", 0, "Final"),
+            ("thinking", 1, "internal reasoning"),
+            ("text", 2, " answer"),
+            ("text", 2, " now"),
+        ]
+
+    @pytest.mark.asyncio
     async def test_stream_anthropic_messages_handoff_to_reasoning_content_does_not_duplicate_text(self):
         """Switching from plain text chunks to reasoning_content must not duplicate emitted text."""
         from omlx.server import stream_anthropic_messages
@@ -1135,17 +1387,41 @@ class TestStreamingHelperFunctions:
 
         thinking_deltas = []
         text_deltas = []
+        content_deltas = []
+        block_events = []
         for event in parsed_events:
-            if event.get("type") != "content_block_delta":
-                continue
-            delta = event.get("delta", {})
-            if delta.get("type") == "thinking_delta":
-                thinking_deltas.append(delta["thinking"])
-            if delta.get("type") == "text_delta":
-                text_deltas.append(delta["text"])
+            if event.get("type") == "content_block_delta":
+                delta = event.get("delta", {})
+                if delta.get("type") == "thinking_delta":
+                    thinking_deltas.append(delta["thinking"])
+                    content_deltas.append(
+                        ("thinking", event.get("index"), delta["thinking"])
+                    )
+                if delta.get("type") == "text_delta":
+                    text_deltas.append(delta["text"])
+                    content_deltas.append(("text", event.get("index"), delta["text"]))
+            elif event.get("type") == "content_block_start":
+                block_events.append(
+                    ("start", event.get("index"), event.get("content_block", {}).get("type"))
+                )
+            elif event.get("type") == "content_block_stop":
+                block_events.append(("stop", event.get("index"), None))
 
         assert "".join(thinking_deltas) == "internal reasoning"
         assert "".join(text_deltas) == "Final answer"
+        assert block_events == [
+            ("start", 0, "text"),
+            ("stop", 0, None),
+            ("start", 1, "thinking"),
+            ("stop", 1, None),
+            ("start", 2, "text"),
+            ("stop", 2, None),
+        ]
+        assert content_deltas == [
+            ("text", 0, "Final"),
+            ("thinking", 1, "internal reasoning"),
+            ("text", 2, " answer"),
+        ]
 
     @pytest.mark.asyncio
     async def test_stream_chat_completion_with_tools_and_tool_calls_keeps_prior_content(self):

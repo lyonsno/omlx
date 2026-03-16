@@ -2261,6 +2261,7 @@ async def stream_chat_completion(
 def _anthropic_reasoning_sources(
     text: str | None,
     reasoning_content: str | None,
+    tokenizer: Any,
 ) -> tuple[str, str, str]:
     """Resolve visible thinking, tool-recovery thinking, and visible text."""
     raw_text = clean_special_tokens(text) if text else ""
@@ -2283,7 +2284,14 @@ def _anthropic_reasoning_sources(
             explicit_reasoning = raw_reasoning
             reasoning_tool_source = raw_reasoning
 
-    display_thinking = explicit_reasoning or text_thinking
+    visible_explicit_reasoning = ""
+    if explicit_reasoning:
+        visible_explicit_reasoning = sanitize_tool_call_markup(
+            explicit_reasoning,
+            tokenizer,
+        ).strip()
+
+    display_thinking = visible_explicit_reasoning or text_thinking
 
     tool_recovery_parts = []
     if text_thinking:
@@ -2407,6 +2415,7 @@ async def stream_anthropic_messages(
                 display_thinking, _, visible_text = _anthropic_reasoning_sources(
                     output.text,
                     output.reasoning_content,
+                    engine.tokenizer,
                 )
                 current_reasoning_display = sanitize_tool_call_markup(
                     display_thinking,
@@ -2416,8 +2425,6 @@ async def stream_anthropic_messages(
                     last_reasoning_display, current_reasoning_display
                 )
                 content_delta = _incremental_suffix(last_visible_content, visible_text)
-                last_reasoning_display = current_reasoning_display
-                last_visible_content = visible_text
             elif output.new_text:
                 thinking_delta, content_delta = thinking_parser.feed(output.new_text)
 
@@ -2571,6 +2578,7 @@ async def stream_anthropic_messages(
             _, thinking_content, regular_content = _anthropic_reasoning_sources(
                 last_output.text,
                 getattr(last_output, "reasoning_content", None),
+                engine.tokenizer,
             )
         else:
             thinking_content, regular_content = extract_thinking(accumulated_text)
@@ -2824,6 +2832,7 @@ async def create_anthropic_message(
     display_thinking, tool_recovery_thinking, regular_content = _anthropic_reasoning_sources(
         output.text,
         getattr(output, "reasoning_content", None),
+        engine.tokenizer,
     )
     cleaned_thinking = sanitize_tool_call_markup(display_thinking, engine.tokenizer)
 

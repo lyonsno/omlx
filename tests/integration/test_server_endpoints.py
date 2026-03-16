@@ -801,6 +801,61 @@ class TestAnthropicMessagesEndpoint:
         assert tool_use_blocks[0]["input"] == {"city": "SF"}
         assert data["stop_reason"] == "tool_use"
 
+    def test_anthropic_messages_tool_only_reasoning_content_does_not_suppress_text_thinking(
+        self, client, mock_llm_engine
+    ):
+        """Tool-call-only reasoning_content should not blank richer thinking extracted from text."""
+
+        async def chat_with_text_thinking_and_tool_only_reasoning(messages, **kwargs):
+            return SimpleNamespace(
+                text=(
+                    "<think>Need to inspect first."
+                    '<tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call>'
+                    "Then continue.</think>Final answer"
+                ),
+                reasoning_content=(
+                    '<tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call>'
+                ),
+                finish_reason="stop",
+                prompt_tokens=10,
+                completion_tokens=5,
+                cached_tokens=0,
+                tool_calls=None,
+            )
+
+        mock_llm_engine.chat = chat_with_text_thinking_and_tool_only_reasoning
+
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "tools": [{
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                }],
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert [block["type"] for block in data["content"]] == [
+            "thinking",
+            "text",
+            "tool_use",
+        ]
+        assert data["content"][0]["thinking"] == "Need to inspect first.Then continue."
+        assert data["content"][1]["text"] == "Final answer"
+        assert data["content"][2]["name"] == "get_weather"
+        assert data["content"][2]["input"] == {"city": "SF"}
+        assert data["stop_reason"] == "tool_use"
+
     def test_anthropic_messages_separate_reasoning_content_becomes_thinking_block(
         self, client, mock_llm_engine
     ):
