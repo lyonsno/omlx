@@ -1325,6 +1325,140 @@ class TestStreamingHelperFunctions:
         ]
 
     @pytest.mark.asyncio
+    async def test_stream_anthropic_messages_hidden_tool_envelope_does_not_replay_visible_text(self):
+        """Filtered tool-call envelopes inside cumulative visible text must not cause replayed text deltas."""
+        from omlx.server import stream_anthropic_messages
+        from omlx.api.anthropic_models import MessagesRequest
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            SimpleNamespace(
+                text="",
+                new_text="",
+                completion_tokens=1,
+                finished=False,
+                finish_reason=None,
+                prompt_tokens=10,
+                cached_tokens=0,
+                tool_calls=None,
+                reasoning_content=(
+                    "<think>internal reasoning</think>"
+                    'Before <tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call> after'
+                ),
+            ),
+            SimpleNamespace(
+                text="",
+                new_text="",
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+                prompt_tokens=10,
+                cached_tokens=0,
+                tool_calls=None,
+                reasoning_content=(
+                    "<think>internal reasoning</think>"
+                    'Before <tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call> after now'
+                ),
+            ),
+        ])
+
+        anthropic_tools = [{
+            "name": "get_weather",
+            "description": "Get weather",
+            "input_schema": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        }]
+        internal_tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }]
+
+        request = MessagesRequest(
+            model="test-model",
+            max_tokens=256,
+            messages=[{"role": "user", "content": "Hi"}],
+            stream=True,
+            tools=anthropic_tools,
+        )
+
+        events = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_anthropic_messages(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=internal_tools,
+        ):
+            events.append(event)
+
+        parsed_events = []
+        for event in events:
+            for line in event.split("\n"):
+                if line.startswith("data: "):
+                    try:
+                        parsed_events.append(json.loads(line[6:]))
+                    except json.JSONDecodeError:
+                        pass
+
+        thinking_deltas = []
+        text_deltas = []
+        content_deltas = []
+        block_events = []
+        tool_use_blocks = []
+        for event in parsed_events:
+            if event.get("type") == "content_block_delta":
+                delta = event.get("delta", {})
+                if delta.get("type") == "thinking_delta":
+                    thinking_deltas.append(delta["thinking"])
+                    content_deltas.append(
+                        ("thinking", event.get("index"), delta["thinking"])
+                    )
+                if delta.get("type") == "text_delta":
+                    text_deltas.append(delta["text"])
+                    content_deltas.append(("text", event.get("index"), delta["text"]))
+            elif event.get("type") == "content_block_start":
+                content_block = event.get("content_block", {})
+                block_events.append(
+                    ("start", event.get("index"), content_block.get("type"))
+                )
+                if content_block.get("type") == "tool_use":
+                    tool_use_blocks.append(content_block.get("name"))
+            elif event.get("type") == "content_block_stop":
+                block_events.append(("stop", event.get("index"), None))
+
+        assert "".join(thinking_deltas) == "internal reasoning"
+        assert "".join(text_deltas) == "Before  after now"
+        assert block_events == [
+            ("start", 0, "thinking"),
+            ("stop", 0, None),
+            ("start", 1, "text"),
+            ("stop", 1, None),
+            ("start", 2, "tool_use"),
+            ("stop", 2, None),
+        ]
+        assert content_deltas == [
+            ("thinking", 0, "internal reasoning"),
+            ("text", 1, "Before  after"),
+            ("text", 1, " now"),
+        ]
+        assert tool_use_blocks == ["get_weather"]
+
+    @pytest.mark.asyncio
     async def test_stream_anthropic_messages_handoff_to_reasoning_content_does_not_duplicate_text(self):
         """Switching from plain text chunks to reasoning_content must not duplicate emitted text."""
         from omlx.server import stream_anthropic_messages

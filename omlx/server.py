@@ -2293,12 +2293,19 @@ def _anthropic_reasoning_sources(
 
     display_thinking = visible_explicit_reasoning or text_thinking
 
-    tool_recovery_parts = []
-    if text_thinking:
-        tool_recovery_parts.append(text_thinking)
-    if reasoning_tool_source and reasoning_tool_source not in tool_recovery_parts:
-        tool_recovery_parts.append(reasoning_tool_source)
-    tool_recovery_thinking = "\n".join(tool_recovery_parts).strip()
+    tool_recovery_thinking = text_thinking.strip()
+    if reasoning_tool_source:
+        reasoning_tool_source = reasoning_tool_source.strip()
+        if not tool_recovery_thinking:
+            tool_recovery_thinking = reasoning_tool_source
+        elif reasoning_tool_source in tool_recovery_thinking:
+            pass
+        elif tool_recovery_thinking in reasoning_tool_source:
+            tool_recovery_thinking = reasoning_tool_source
+        else:
+            tool_recovery_thinking = (
+                f"{tool_recovery_thinking}\n{reasoning_tool_source}"
+            ).strip()
 
     visible_text = text_content
     if reasoning_text_suffix and (
@@ -2407,6 +2414,8 @@ async def stream_anthropic_messages(
 
             thinking_delta = ""
             content_delta = ""
+            thinking_delta_sanitized = False
+            content_delta_sanitized = False
             if output.new_text:
                 accumulated_text += output.new_text
 
@@ -2421,16 +2430,26 @@ async def stream_anthropic_messages(
                     display_thinking,
                     engine.tokenizer,
                 )
+                current_visible_content = visible_text
+                if tool_filter:
+                    current_visible_content = sanitize_tool_call_markup(
+                        visible_text,
+                        engine.tokenizer,
+                    )
                 thinking_delta = _incremental_suffix(
                     last_reasoning_display, current_reasoning_display
                 )
-                content_delta = _incremental_suffix(last_visible_content, visible_text)
+                content_delta = _incremental_suffix(
+                    last_visible_content, current_visible_content
+                )
+                thinking_delta_sanitized = True
+                content_delta_sanitized = bool(tool_filter)
             elif output.new_text:
                 thinking_delta, content_delta = thinking_parser.feed(output.new_text)
 
             # Emit thinking content as thinking block
             if thinking_delta:
-                if thinking_filter:
+                if thinking_filter and not thinking_delta_sanitized:
                     thinking_delta = thinking_filter.feed(thinking_delta)
                 if not thinking_block_started:
                     if text_block_started:
@@ -2451,7 +2470,7 @@ async def stream_anthropic_messages(
             # Emit regular content as text block — filter tool-call
             # markup when a known start marker is available.
             if content_delta:
-                if tool_filter:
+                if tool_filter and not content_delta_sanitized:
                     content_delta = tool_filter.feed(content_delta)
                 if content_delta:
                     # Close thinking block if transitioning to text
