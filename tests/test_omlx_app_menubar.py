@@ -289,6 +289,51 @@ class TestMenubarMonitoring:
             excludes=("tok/s", "None", "left", "req", "wait"),
         )
 
+    def test_update_menubar_icon_handles_multiple_prefills_for_one_model(self, app_module):
+        """Concurrent prefills should show the aggregate count and the most informative request."""
+        stats = {
+            "avg_generation_tps": 78.4,
+            "active_models": {
+                "total_active_requests": 0,
+                "total_waiting_requests": 2,
+                "models": [
+                    {
+                        "id": "mlx-community/Qwen3-Coder-30B-A3B",
+                        "active_requests": 0,
+                        "waiting_requests": 2,
+                        "prefilling": [
+                            {
+                                "request_id": "req-cold",
+                                "processed": 256,
+                                "total": 4096,
+                                "speed": 0.0,
+                                "eta": None,
+                            },
+                            {
+                                "request_id": "req-hot",
+                                "processed": 2048,
+                                "total": 8192,
+                                "speed": 300.4,
+                                "eta": 19.6,
+                            },
+                        ],
+                    }
+                ],
+            },
+        }
+        delegate, status_item, button = self._make_delegate(
+            app_module, stats, app_module.ServerStatus.RUNNING
+        )
+
+        app_module.OMLXAppDelegate._update_menubar_icon(delegate)
+
+        self._assert_final_icon(button, "filled-icon")
+        self._assert_title_fragments(
+            status_item,
+            includes=("2 PP", "2.0k/8.2k tok", "300 tok/s", "20s"),
+            excludes=("256/4.1k tok", "None", "req", "wait"),
+        )
+
     def test_update_menubar_icon_shows_live_request_counts_when_generating(self, app_module):
         """Generation-only activity should use aggregate load, not the first model row."""
         stats = {
