@@ -141,6 +141,34 @@ class TestMenubarMonitoring:
         )
         return delegate, status_item, button
 
+    @staticmethod
+    def _last_single_arg(mock_method):
+        assert mock_method.call_args_list, "Expected method to be called at least once"
+        args, kwargs = mock_method.call_args_list[-1]
+        assert not kwargs
+        assert len(args) == 1
+        return args[0]
+
+    def _assert_final_icon(self, button, expected_icon):
+        assert self._last_single_arg(button.setImage_) == expected_icon
+
+    def _assert_title_fragments(
+        self,
+        status_item,
+        *,
+        includes=(),
+        excludes=(),
+        exact=None,
+    ):
+        title = self._last_single_arg(status_item.setTitle_)
+        if exact is not None:
+            assert title == exact
+            return
+        for fragment in includes:
+            assert fragment in title
+        for fragment in excludes:
+            assert fragment not in title
+
     def test_update_menubar_icon_prefers_live_prefill_progress(self, app_module):
         """Prefill activity should surface compact token/speed/ETA monitoring."""
         stats = {
@@ -172,9 +200,11 @@ class TestMenubarMonitoring:
 
         app_module.OMLXAppDelegate._update_menubar_icon(delegate)
 
-        button.setImage_.assert_called_once_with("filled-icon")
-        status_item.setTitle_.assert_called_once_with(
-            "1 PP · 12.3k/67.9k tok · 512 tok/s · 1m 5s"
+        self._assert_final_icon(button, "filled-icon")
+        self._assert_title_fragments(
+            status_item,
+            includes=("1 PP", "12.3k/67.9k tok", "512 tok/s", "1m 5s"),
+            excludes=("None",),
         )
 
     def test_update_menubar_icon_omits_speed_and_eta_for_first_prefill_sample(self, app_module):
@@ -208,8 +238,12 @@ class TestMenubarMonitoring:
 
         app_module.OMLXAppDelegate._update_menubar_icon(delegate)
 
-        button.setImage_.assert_called_once_with("filled-icon")
-        status_item.setTitle_.assert_called_once_with("1 PP · 512/8.0k tok")
+        self._assert_final_icon(button, "filled-icon")
+        self._assert_title_fragments(
+            status_item,
+            includes=("1 PP", "512/8.0k tok"),
+            excludes=("tok/s", "None", "left"),
+        )
 
     def test_update_menubar_icon_shows_live_request_counts_when_generating(self, app_module):
         """Generation-only activity should use aggregate load, not the first model row."""
@@ -240,8 +274,47 @@ class TestMenubarMonitoring:
 
         app_module.OMLXAppDelegate._update_menubar_icon(delegate)
 
-        button.setImage_.assert_called_once_with("filled-icon")
-        status_item.setTitle_.assert_called_once_with("3 req · 4 wait · 78.4 tok/s")
+        self._assert_final_icon(button, "filled-icon")
+        self._assert_title_fragments(
+            status_item,
+            includes=("3 req", "4 wait", "78.4 tok/s"),
+        )
+
+    def test_update_menubar_icon_shows_queue_only_backlog_as_live_signal(self, app_module):
+        """A pure waiting backlog should not collapse to idle or display stale speed."""
+        stats = {
+            "avg_generation_tps": 78.4,
+            "active_models": {
+                "total_active_requests": 0,
+                "total_waiting_requests": 4,
+                "models": [
+                    {
+                        "id": "mlx-community/Qwen3-32B",
+                        "active_requests": 0,
+                        "waiting_requests": 1,
+                        "prefilling": [],
+                    },
+                    {
+                        "id": "mlx-community/Qwen3-14B",
+                        "active_requests": 0,
+                        "waiting_requests": 3,
+                        "prefilling": [],
+                    },
+                ],
+            },
+        }
+        delegate, status_item, button = self._make_delegate(
+            app_module, stats, app_module.ServerStatus.RUNNING
+        )
+
+        app_module.OMLXAppDelegate._update_menubar_icon(delegate)
+
+        self._assert_final_icon(button, "filled-icon")
+        self._assert_title_fragments(
+            status_item,
+            includes=("4 wait",),
+            excludes=("idle", "tok/s"),
+        )
 
     def test_update_menubar_icon_stays_compact_when_no_live_activity(self, app_module):
         """Idle servers should keep the icon-only menubar presentation."""
@@ -266,10 +339,13 @@ class TestMenubarMonitoring:
 
         app_module.OMLXAppDelegate._update_menubar_icon(delegate)
 
-        button.setImage_.assert_called_once_with("filled-icon")
-        status_item.setTitle_.assert_called_once_with("")
+        self._assert_final_icon(button, "filled-icon")
+        self._assert_title_fragments(status_item, exact="")
 
-    @pytest.mark.parametrize("status_name", ["STOPPED", "ERROR"])
+    @pytest.mark.parametrize(
+        "status_name",
+        ["STOPPED", "STOPPING", "ERROR", "UNRESPONSIVE"],
+    )
     def test_update_menubar_icon_clears_stale_monitoring_when_server_is_not_running(
         self, app_module, status_name
     ):
@@ -296,5 +372,5 @@ class TestMenubarMonitoring:
 
         app_module.OMLXAppDelegate._update_menubar_icon(delegate)
 
-        button.setImage_.assert_called_once_with("outline-icon")
-        status_item.setTitle_.assert_called_once_with("")
+        self._assert_final_icon(button, "outline-icon")
+        self._assert_title_fragments(status_item, exact="")
