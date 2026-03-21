@@ -501,3 +501,55 @@ class TestMenubarMonitoring:
 
         self._assert_final_icon(button, "outline-icon")
         self._assert_title_fragments(status_item, exact="")
+
+    def test_update_menubar_icon_falls_back_to_oMLX_text_when_icons_missing_and_idle(
+        self, app_module
+    ):
+        """When icons fail to load and server is idle, menu bar should show 'oMLX' fallback."""
+        stats = {
+            "avg_generation_tps": 0.0,
+            "active_models": {
+                "total_active_requests": 0,
+                "total_waiting_requests": 0,
+                "models": [],
+            },
+        }
+        delegate, status_item, button = self._make_delegate(
+            app_module, stats, app_module.ServerStatus.STOPPED
+        )
+        # Simulate failed icon loading
+        delegate._icon_outline = None
+        delegate._icon_filled = None
+
+        app_module.OMLXAppDelegate._update_menubar_icon(delegate)
+
+        # No icon should be set when both are None
+        button.setImage_.assert_not_called()
+        # Fallback text should be "oMLX"
+        self._assert_title_fragments(status_item, exact="oMLX")
+
+    def test_update_menubar_icon_shows_stats_text_when_icons_missing_but_active(
+        self, app_module
+    ):
+        """When icons fail to load but server has activity, menu bar should show stats as text."""
+        stats = {
+            "avg_generation_tps": 50.5,
+            "active_models": {
+                "total_active_requests": 2,
+                "total_waiting_requests": 1,
+                "models": [],
+            },
+        }
+        delegate, status_item, button = self._make_delegate(
+            app_module, stats, app_module.ServerStatus.RUNNING
+        )
+        # Simulate failed icon loading
+        delegate._icon_outline = None
+        delegate._icon_filled = None
+
+        app_module.OMLXAppDelegate._update_menubar_icon(delegate)
+
+        # No icon should be set when both are None
+        button.setImage_.assert_not_called()
+        # Should show formatted stats as fallback text
+        self._assert_title_fragments(status_item, includes=["2 req", "1 wait", "50.5 tok/s"])

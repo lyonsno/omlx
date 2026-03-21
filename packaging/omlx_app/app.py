@@ -278,10 +278,15 @@ class OMLXAppDelegate(NSObject):
             if button:
                 button.setImage_(icon)
 
-        # Always set the title
-        self.status_item.setTitle_(title)
+        if icon:
+            # When icon is set, title is either stats (if activity) or empty
+            self.status_item.setTitle_(title)
+        else:
+            # Fallback to text if icons not available
+            # Show activity stats if available, otherwise "oMLX"
+            self.status_item.setTitle_(title if title else "oMLX")
 
-    # --- Update checking ---
+   # --- Update checking ---
 
     def _format_menubar_title(self, stats: dict) -> str:
         """Format monitoring text for menubar based on current activity."""
