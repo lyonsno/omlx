@@ -139,6 +139,17 @@ class TestMenubarMonitoring:
             _icon_filled="filled-icon",
             _cached_stats=stats,
         )
+        for method_name in (
+            "_format_menubar_title",
+            "_format_token_count",
+            "_format_speed",
+            "_format_eta",
+        ):
+            setattr(
+                delegate,
+                method_name,
+                getattr(app_module.OMLXAppDelegate, method_name).__get__(delegate),
+            )
         return delegate, status_item, button
 
     @staticmethod

@@ -9,12 +9,9 @@ import platform
 import time
 import webbrowser
 from pathlib import Path
-from typing import Optional
 
 import objc
 import requests
-
-from omlx._version import __version__
 from AppKit import (
     NSApp,
     NSAppearanceNameDarkAqua,
@@ -31,7 +28,9 @@ from AppKit import (
     NSStatusBar,
     NSVariableStatusItemLength,
 )
-from Foundation import NSData, NSObject, NSRunLoop, NSDefaultRunLoopMode, NSTimer
+from Foundation import NSData, NSDefaultRunLoopMode, NSObject, NSRunLoop, NSTimer
+
+from omlx._version import __version__
 
 from .config import ServerConfig
 from .server_manager import PortConflict, ServerManager, ServerStatus
@@ -80,13 +79,13 @@ class OMLXAppDelegate(NSObject):
         self.health_timer = None
         self.welcome_controller = None
         self.preferences_controller = None
-        self._cached_stats: Optional[dict] = None
-        self._cached_alltime_stats: Optional[dict] = None
+        self._cached_stats: dict | None = None
+        self._cached_alltime_stats: dict | None = None
         self._last_stats_fetch: float = 0
-        self._admin_session: Optional[requests.Session] = None
-        self._icon_outline: Optional[NSImage] = None
-        self._icon_filled: Optional[NSImage] = None
-        self._update_info: Optional[dict] = None
+        self._admin_session: requests.Session | None = None
+        self._icon_outline: NSImage | None = None
+        self._icon_filled: NSImage | None = None
+        self._update_info: dict | None = None
         self._last_update_check: float = 0
         self._updater = None  # AppUpdater instance during download
         self._update_progress_text = ""  # Current download progress text
@@ -194,7 +193,7 @@ class OMLXAppDelegate(NSObject):
             return dev_path
         return Path(__file__).parent
 
-    def _load_menubar_icon(self, svg_name: str) -> Optional[NSImage]:
+    def _load_menubar_icon(self, svg_name: str) -> NSImage | None:
         """Load an SVG file as a template image for the menubar.
 
         Template images automatically adapt to menubar background:
@@ -235,32 +234,149 @@ class OMLXAppDelegate(NSObject):
         return False
 
     def _update_menubar_icon(self):
-        """Update menubar icon based on server state.
+        """Update menubar icon based on server state and live activity.
 
         Template images automatically adapt to menubar background color,
         so we only need to switch between outline (OFF) and filled (ON).
+        When server is running with activity, display live monitoring text.
         """
         if self.status_item is None:
             return
 
-        is_running = self.server_manager.status in (
-            ServerStatus.RUNNING,
-            ServerStatus.STARTING,
-        )
+        status = self.server_manager.status
+        is_running = status == ServerStatus.RUNNING
 
-        # Simple: only server state matters (theme handled by template image)
-        icon = self._icon_filled if is_running else self._icon_outline
+        # Determine icon based on status and activity
+        has_live_activity = False
+        if is_running and self._cached_stats:
+            stats = self._cached_stats
+            active_models = stats.get("active_models", {})
+            total_active = active_models.get("total_active_requests", 0)
+            total_waiting = active_models.get("total_waiting_requests", 0)
+
+            # Check for prefill activity
+            models = active_models.get("models", [])
+            for model in models:
+                if model.get("prefilling", []):
+                    has_live_activity = True
+                    break
+
+            # Generation-only activity counts as live if there are requests or waiting
+            if not has_live_activity and (total_active > 0 or total_waiting > 0):
+                has_live_activity = True
+
+        # Icon: filled when server is RUNNING or STARTING; outline otherwise
+        icon = self._icon_filled if status in (ServerStatus.RUNNING, ServerStatus.STARTING) else self._icon_outline
+
+        # Title: show monitoring text only when running with live activity
+        title = ""
+        if is_running and has_live_activity:
+            title = self._format_menubar_title(stats)
 
         if icon:
             button = self.status_item.button()
             if button:
                 button.setImage_(icon)
-            self.status_item.setTitle_("")
-        else:
-            # Fallback to text if icons not available
-            self.status_item.setTitle_("oMLX")
+
+        # Always set the title
+        self.status_item.setTitle_(title)
 
     # --- Update checking ---
+
+    def _format_menubar_title(self, stats: dict) -> str:
+        """Format monitoring text for menubar based on current activity."""
+        active_models = stats.get("active_models", {})
+        models = active_models.get("models", [])
+
+        # Look for prefill activity across all models
+        total_prefill_processed = 0
+        total_prefill_total = 0
+        prefill_speed = 0.0
+        prefill_eta = None
+        prefill_count = 0
+        best_prefill_processed = 0
+        best_prefill_total = 0
+
+        for model in models:
+            for prefill in model.get("prefilling", []):
+                prefill_count += 1
+                # Use the most informative prefill (has speed/eta)
+                speed = prefill.get("speed", 0.0)
+                eta = prefill.get("eta")
+                if speed > 0 and eta is not None and (best_prefill_processed == 0 or True):
+                    prefill_speed = speed
+                    prefill_eta = eta
+                    best_prefill_processed = prefill.get("processed", 0)
+                    best_prefill_total = prefill.get("total", 0)
+
+        # If no prefill with speed/eta, use the first one
+        if best_prefill_processed == 0 and prefill_count > 0:
+            for model in models:
+                for prefill in model.get("prefilling", []):
+                    best_prefill_processed = prefill.get("processed", 0)
+                    best_prefill_total = prefill.get("total", 0)
+                    break
+                if best_prefill_processed > 0:
+                    break
+
+        if prefill_count > 0:
+            # Format prefill progress
+            processed_str = self._format_token_count(best_prefill_processed)
+            total_str = self._format_token_count(best_prefill_total)
+            speed_str = self._format_speed(prefill_speed) if prefill_speed > 0 else ""
+            eta_str = self._format_eta(prefill_eta) if prefill_eta is not None else ""
+
+            parts = [f"{prefill_count} PP", f"{processed_str}/{total_str} tok"]
+            if speed_str:
+                parts.append(speed_str)
+            if eta_str:
+                parts.append(eta_str)
+            return " ".join(parts)
+
+        # No prefill - show generation activity
+        total_active = active_models.get("total_active_requests", 0)
+        total_waiting = active_models.get("total_waiting_requests", 0)
+        avg_tps = stats.get("avg_generation_tps", 0.0)
+
+        parts = []
+        if total_active > 0:
+            parts.append(f"{total_active} req")
+        if total_waiting > 0:
+            parts.append(f"{total_waiting} wait")
+        # Only show TPS if there is active generation (total_active > 0)
+        if avg_tps > 0 and total_active > 0:
+            parts.append(f"{avg_tps:.1f} tok/s")
+
+        return " ".join(parts) if parts else ""
+
+    def _format_token_count(self, count: int) -> str:
+        """Format token count with appropriate suffix (k, M, etc)."""
+        if count >= 1_000_000:
+            return f"{count / 1_000_000:.1f}M"
+        elif count >= 1_000:
+            return f"{count / 1_000:.1f}k"
+        else:
+            return str(count)
+
+    def _format_speed(self, speed: float) -> str:
+        """Format speed with appropriate suffix."""
+        if speed >= 1000:
+            return f"{speed / 1000:.0f}k tok/s"
+        else:
+            return f"{speed:.0f} tok/s"
+
+    def _format_eta(self, seconds: float) -> str:
+        """Format ETA in human-readable format."""
+        if seconds < 60:
+            return f"{round(seconds)}s"
+        elif seconds < 3600:
+            minutes = int(seconds // 60)
+            secs = int(seconds % 60)
+            return f"{minutes}m {secs}s"
+        else:
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            return f"{hours}h {minutes}m"
 
     def _check_for_updates(self):
         """Check GitHub Releases for new version (cached for 24 hours)."""
@@ -461,7 +577,7 @@ class OMLXAppDelegate(NSObject):
 
     # --- Menu building ---
 
-    def _create_menu_icon(self, sf_symbol: str) -> Optional[NSImage]:
+    def _create_menu_icon(self, sf_symbol: str) -> NSImage | None:
         """Create a menu item icon from SF Symbol (macOS 11+).
 
         Returns a template image that automatically adapts to menu theme.
