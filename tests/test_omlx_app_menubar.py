@@ -204,7 +204,51 @@ class TestMenubarMonitoring:
         self._assert_title_fragments(
             status_item,
             includes=("1 PP", "12.3k/67.9k tok", "512 tok/s", "1m 5s"),
-            excludes=("None",),
+            excludes=("None", "req", "wait", "78.4 tok/s"),
+        )
+
+    def test_update_menubar_icon_finds_prefill_beyond_first_model_row(self, app_module):
+        """Prefill should win even when the first model row has only generation/backlog state."""
+        stats = {
+            "avg_generation_tps": 78.4,
+            "active_models": {
+                "total_active_requests": 2,
+                "total_waiting_requests": 3,
+                "models": [
+                    {
+                        "id": "mlx-community/Qwen3-32B",
+                        "active_requests": 2,
+                        "waiting_requests": 2,
+                        "prefilling": [],
+                    },
+                    {
+                        "id": "mlx-community/Qwen3-14B",
+                        "active_requests": 0,
+                        "waiting_requests": 1,
+                        "prefilling": [
+                            {
+                                "request_id": "req-late",
+                                "processed": 4096,
+                                "total": 16384,
+                                "speed": 256.2,
+                                "eta": 48.8,
+                            }
+                        ],
+                    },
+                ],
+            },
+        }
+        delegate, status_item, button = self._make_delegate(
+            app_module, stats, app_module.ServerStatus.RUNNING
+        )
+
+        app_module.OMLXAppDelegate._update_menubar_icon(delegate)
+
+        self._assert_final_icon(button, "filled-icon")
+        self._assert_title_fragments(
+            status_item,
+            includes=("1 PP", "4.1k/16.4k tok", "256 tok/s", "49s"),
+            excludes=("req", "wait", "78.4 tok/s"),
         )
 
     def test_update_menubar_icon_omits_speed_and_eta_for_first_prefill_sample(self, app_module):
@@ -242,7 +286,7 @@ class TestMenubarMonitoring:
         self._assert_title_fragments(
             status_item,
             includes=("1 PP", "512/8.0k tok"),
-            excludes=("tok/s", "None", "left"),
+            excludes=("tok/s", "None", "left", "req", "wait"),
         )
 
     def test_update_menubar_icon_shows_live_request_counts_when_generating(self, app_module):
@@ -278,6 +322,7 @@ class TestMenubarMonitoring:
         self._assert_title_fragments(
             status_item,
             includes=("3 req", "4 wait", "78.4 tok/s"),
+            excludes=("PP", "12.3k/67.9k tok", "512/8.0k tok"),
         )
 
     def test_update_menubar_icon_shows_queue_only_backlog_as_live_signal(self, app_module):
@@ -313,7 +358,7 @@ class TestMenubarMonitoring:
         self._assert_title_fragments(
             status_item,
             includes=("4 wait",),
-            excludes=("idle", "tok/s"),
+            excludes=("idle", "tok/s", "PP", "req"),
         )
 
     def test_update_menubar_icon_stays_compact_when_no_live_activity(self, app_module):
@@ -335,6 +380,32 @@ class TestMenubarMonitoring:
         }
         delegate, status_item, button = self._make_delegate(
             app_module, stats, app_module.ServerStatus.RUNNING
+        )
+
+        app_module.OMLXAppDelegate._update_menubar_icon(delegate)
+
+        self._assert_final_icon(button, "filled-icon")
+        self._assert_title_fragments(status_item, exact="")
+
+    def test_update_menubar_icon_clears_stale_monitoring_while_starting(self, app_module):
+        """STARTING should not reuse stale live-monitor text from a previous run."""
+        stats = {
+            "avg_generation_tps": 78.4,
+            "active_models": {
+                "total_active_requests": 3,
+                "total_waiting_requests": 4,
+                "models": [
+                    {
+                        "id": "mlx-community/Qwen3-32B",
+                        "active_requests": 3,
+                        "waiting_requests": 4,
+                        "prefilling": [],
+                    }
+                ],
+            },
+        }
+        delegate, status_item, button = self._make_delegate(
+            app_module, stats, app_module.ServerStatus.STARTING
         )
 
         app_module.OMLXAppDelegate._update_menubar_icon(delegate)
