@@ -14,7 +14,7 @@ from typing import Optional
 import objc
 import requests
 
-from omlx._version import __version__
+from . import __version__
 from AppKit import (
     NSApp,
     NSAppearanceNameDarkAqua,
