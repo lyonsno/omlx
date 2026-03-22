@@ -24,6 +24,7 @@ def app_module():
         "AppKit",
         "Foundation",
         "omlx._version",
+        "omlx_app",
         "omlx_app.app",
         "omlx_app.config",
         "omlx_app.server_manager",
@@ -90,6 +91,7 @@ def app_module():
     class FakeServerStatus:
         RUNNING = "running"
         STARTING = "starting"
+        STOPPING = "stopping"
         STOPPED = "stopped"
         ERROR = "error"
         UNRESPONSIVE = "unresponsive"
@@ -593,6 +595,56 @@ class TestAsyncStatsRefreshContract:
         app_module.OMLXAppDelegate.statsRefreshFinishedOnMain_(delegate, stale_payload)
 
         assert delegate._stats_refresh_token == 10
+        assert delegate._cached_stats is None
+        assert delegate._cached_alltime_stats is None
+        assert delegate._admin_session is None
+
+    def test_health_check_stopping_then_delayed_callback_still_invalidates_generation(
+        self, app_module
+    ):
+        """RUNNING -> STOPPING sampled by timer must invalidate even if callback arrives late."""
+        delegate = _make_delegate(
+            app_module,
+            status=app_module.ServerStatus.STOPPING,
+            last_health_status=app_module.ServerStatus.RUNNING,
+            in_flight=True,
+            refresh_token=12,
+            last_stats_fetch=30.0,
+            last_started_at=30.0,
+        )
+        delegate._cached_stats = {"old": 1}
+        delegate._cached_alltime_stats = {"old_total": 2}
+        delegate._admin_session = object()
+
+        app_module.OMLXAppDelegate.healthCheck_(delegate, None)
+
+        assert delegate._stats_refresh_token == 13
+        assert delegate._stats_refresh_in_flight is False
+        assert delegate._cached_stats is None
+        assert delegate._cached_alltime_stats is None
+        assert delegate._admin_session is None
+        assert delegate._last_health_status == app_module.ServerStatus.STOPPING
+
+        app_module.OMLXAppDelegate.serverStatusChangedOnMain_(
+            delegate, app_module.ServerStatus.STOPPING
+        )
+        assert delegate._stats_refresh_token == 13
+
+        delegate.server_manager.status = app_module.ServerStatus.RUNNING
+        app_module.OMLXAppDelegate.serverStatusChangedOnMain_(
+            delegate, app_module.ServerStatus.RUNNING
+        )
+
+        stale_payload = {
+            "token": 12,
+            "finished_at": 31.0,
+            "stats": {"stale": True},
+            "alltime_stats": {"stale": True},
+            "session": object(),
+        }
+        app_module.OMLXAppDelegate.statsRefreshFinishedOnMain_(delegate, stale_payload)
+
+        assert delegate._stats_refresh_token == 13
         assert delegate._cached_stats is None
         assert delegate._cached_alltime_stats is None
         assert delegate._admin_session is None

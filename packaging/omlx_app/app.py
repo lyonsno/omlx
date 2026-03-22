@@ -950,6 +950,7 @@ class OMLXAppDelegate(NSObject):
             ServerStatus.ERROR,
             ServerStatus.UNRESPONSIVE,
             ServerStatus.STARTING,
+            ServerStatus.STOPPING,
             ServerStatus.STOPPED,
         ):
             if previous_status == ServerStatus.RUNNING:
