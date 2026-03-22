@@ -553,3 +553,263 @@ class TestMenubarMonitoring:
         button.setImage_.assert_not_called()
         # Should show formatted stats as fallback text
         self._assert_title_fragments(status_item, includes=["2 req", "1 wait", "50.5 tok/s"])
+
+    def test_update_menubar_icon_selects_best_prefill_among_concurrent_informative_prefills(
+        self, app_module
+    ):
+        """Two informative prefills should select the most progressed one, not last in iteration order.
+
+        This is a contract test that exposes the bug where iteration order determines
+        selection rather than a stable "best sample" rule. The bug is in _format_menubar_title():306
+        where the guard `best_prefill_processed == 0 or True` is always true, causing every
+        informative prefill to overwrite the previous one.
+
+        Scenario:
+        - Prefill A: 3000/4000 tok, 100 tok/s, 10s eta (MOST INFORMATIVE: most progressed)
+        - Prefill B: 1000/4000 tok, 50 tok/s, 60s eta (LESS INFORMATIVE)
+
+        Expected: Prefill A should be selected (most progressed / most informative)
+        Buggy behavior: Prefill B would be selected (last in iteration order)
+        """
+        stats = {
+            "avg_generation_tps": 78.4,
+            "active_models": {
+                "total_active_requests": 0,
+                "total_waiting_requests": 2,
+                "models": [
+                    {
+                        "id": "mlx-community/Qwen3-Coder-30B-A3B",
+                        "active_requests": 0,
+                        "waiting_requests": 2,
+                        "prefilling": [
+                            {
+                                "request_id": "req-most-progressed",
+                                "processed": 3000,
+                                "total": 4000,
+                                "speed": 100.0,
+                                "eta": 10.0,
+                            },
+                            {
+                                "request_id": "req-less-progressed",
+                                "processed": 1000,
+                                "total": 4000,
+                                "speed": 50.0,
+                                "eta": 60.0,
+                            },
+                        ],
+                    }
+                ],
+            },
+        }
+        delegate, status_item, button = self._make_delegate(
+            app_module, stats, app_module.ServerStatus.RUNNING
+        )
+
+        app_module.OMLXAppDelegate._update_menubar_icon(delegate)
+
+        self._assert_final_icon(button, "filled-icon")
+        # Should show the MOST INFORMATIVE prefill (3000/4000, 100 tok/s, 10s)
+        # NOT the last one in iteration order (1000/4000, 50 tok/s, 60s)
+        self._assert_title_fragments(
+            status_item,
+            includes=("2 PP", "3.0k/4.0k tok", "100 tok/s", "10s"),
+            excludes=("1.0k/4.0k tok", "50 tok/s", "60s", "req", "wait"),
+        )
+
+    def test_update_menubar_icon_selects_best_prefill_across_multiple_models(
+        self, app_module
+    ):
+        """Concurrent prefills across models should select the most progressed, not last model in iteration.
+
+        This tests the contract that when multiple models have informative prefills,
+        the one with the highest processed value wins regardless of model iteration order.
+
+        Scenario (reversed order to expose bug):
+        - Model B: 3000/4000 tok, 100 tok/s, 10s eta (MOST PRORESSED - FIRST in iteration)
+        - Model A: 2000/4000 tok, 80 tok/s, 25s eta (LESS PRORESSED - LAST in iteration)
+
+        Expected: Model B's prefill should be selected (3000 > 2000)
+        Buggy behavior: Model A's prefill (2000) would be selected due to `or True` bug
+        where every informative prefill overwrites the previous one regardless of processed value.
+        """
+        stats = {
+            "avg_generation_tps": 78.4,
+            "active_models": {
+                "total_active_requests": 0,
+                "total_waiting_requests": 2,
+                "models": [
+                    {
+                        "id": "model-B",
+                        "active_requests": 0,
+                        "waiting_requests": 1,
+                        "prefilling": [
+                            {
+                                "request_id": "req-b",
+                                "processed": 3000,  # MOST PRORESSED - FIRST
+                                "total": 4000,
+                                "speed": 100.0,
+                                "eta": 10.0,
+                            },
+                        ],
+                    },
+                    {
+                        "id": "model-A",
+                        "active_requests": 0,
+                        "waiting_requests": 1,
+                        "prefilling": [
+                            {
+                                "request_id": "req-a",
+                                "processed": 2000,  # LESS PRORESSED - LAST (bug would pick this)
+                                "total": 4000,
+                                "speed": 80.0,
+                                "eta": 25.0,
+                            },
+                        ],
+                    },
+                ],
+            },
+        }
+        delegate, status_item, button = self._make_delegate(
+            app_module, stats, app_module.ServerStatus.RUNNING
+        )
+
+        app_module.OMLXAppDelegate._update_menubar_icon(delegate)
+
+        self._assert_final_icon(button, "filled-icon")
+        # Should show Model B's prefill (3000 > 2000), NOT Model A's (last in iteration)
+        self._assert_title_fragments(
+            status_item,
+            includes=("2 PP", "3.0k/4.0k tok", "100 tok/s", "10s"),
+            excludes=("2.0k/4.0k tok", "80 tok/s", "25s"),
+        )
+
+    def test_update_menubar_icon_tie_breaks_by_speed_when_processed_equal(
+        self, app_module
+    ):
+        """When processed values are equal, faster speed should win as tie-breaker.
+
+        This tests the tie-breaker contract: among prefills with equal processed values,
+        the one with higher speed (faster progress rate) should be selected.
+
+        Scenario (reversed order to expose bug):
+        - Model B: 2000/4000 tok, 100 tok/s, 20s eta (Faster - FIRST in iteration)
+        - Model A: 2000/4000 tok, 50 tok/s, 40s eta (Slower - LAST in iteration)
+
+        Expected: Model B's prefill should be selected (same processed, higher speed)
+        Buggy behavior: Model A's prefill (50 tok/s) would be selected due to iteration order
+        overwriting, since the `or True` bug causes every informative prefill to overwrite.
+        Note: If this test fails, it means tie-breaker logic is not implemented.
+        """
+        stats = {
+            "avg_generation_tps": 78.4,
+            "active_models": {
+                "total_active_requests": 0,
+                "total_waiting_requests": 2,
+                "models": [
+                    {
+                        "id": "model-B",
+                        "active_requests": 0,
+                        "waiting_requests": 1,
+                        "prefilling": [
+                            {
+                                "request_id": "req-faster",
+                                "processed": 2000,  # EQUAL processed - FIRST
+                                "total": 4000,
+                                "speed": 100.0,    # Faster
+                                "eta": 20.0,
+                            },
+                        ],
+                    },
+                    {
+                        "id": "model-A",
+                        "active_requests": 0,
+                        "waiting_requests": 1,
+                        "prefilling": [
+                            {
+                                "request_id": "req-slower",
+                                "processed": 2000,
+                                "total": 4000,
+                                "speed": 50.0,   # Slower - LAST (bug would pick this)
+                                "eta": 40.0,
+                            },
+                        ],
+                    },
+                ],
+            },
+        }
+        delegate, status_item, button = self._make_delegate(
+            app_module, stats, app_module.ServerStatus.RUNNING
+        )
+
+        app_module.OMLXAppDelegate._update_menubar_icon(delegate)
+
+        self._assert_final_icon(button, "filled-icon")
+        # Should show faster speed (100 tok/s) as tie-breaker, NOT slower (last in iteration)
+        self._assert_title_fragments(
+            status_item,
+            includes=("2 PP", "2.0k/4.0k tok", "100 tok/s", "20s"),
+            excludes=("50 tok/s", "40s"),
+        )
+
+    def test_update_menubar_icon_fallbacks_to_first_prefill_when_no_speed_eta(
+        self, app_module
+    ):
+        """When no prefill has speed/eta, first prefill should be displayed (fallback path).
+
+        This tests the fallback contract: when prefills exist but none have both
+        speed > 0 and eta is not None, the first prefill in iteration order should be used.
+
+        Scenario:
+        - Model A has two prefills, both without speed/eta:
+          - First: 512/4096 tok, speed=0, eta=None
+          - Second: 1024/4096 tok, speed=0, eta=None
+
+        Expected: First prefill (512/4096) should be shown
+        Buggy behavior: The `or True` condition at line 306 makes this fallback unreachable
+
+        This test also serves as regression test for the `or True` bug.
+        """
+        stats = {
+            "avg_generation_tps": 78.4,
+            "active_models": {
+                "total_active_requests": 0,
+                "total_waiting_requests": 3,
+                "models": [
+                    {
+                        "id": "model-A",
+                        "active_requests": 0,
+                        "waiting_requests": 2,
+                        "prefilling": [
+                            {
+                                "request_id": "req-first",
+                                "processed": 512,
+                                "total": 4096,
+                                "speed": 0.0,     # NO speed
+                                "eta": None,       # NO eta
+                            },
+                            {
+                                "request_id": "req-second",
+                                "processed": 1024,
+                                "total": 4096,
+                                "speed": 0.0,     # NO speed
+                                "eta": None,       # NO eta
+                            },
+                        ],
+                    },
+                ],
+            },
+        }
+        delegate, status_item, button = self._make_delegate(
+            app_module, stats, app_module.ServerStatus.RUNNING
+        )
+
+        app_module.OMLXAppDelegate._update_menubar_icon(delegate)
+
+        self._assert_final_icon(button, "filled-icon")
+        # Should show first prefill (512/4096), not second (1024/4096)
+        # Since no speed/eta, those should not appear in the title
+        self._assert_title_fragments(
+            status_item,
+            includes=("2 PP", "512/4.1k tok"),  # First prefill
+            excludes=("1.0k/4.1k tok", "tok/s", "None", "left"),  # No speed/eta shown
+        )

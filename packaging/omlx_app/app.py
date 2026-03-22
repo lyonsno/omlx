@@ -289,7 +289,15 @@ class OMLXAppDelegate(NSObject):
    # --- Update checking ---
 
     def _format_menubar_title(self, stats: dict) -> str:
-        """Format monitoring text for menubar based on current activity."""
+        """Format monitoring text for menubar based on current activity.
+        
+        Prefill selection contract:
+        - Among informative prefills (speed > 0 AND eta is not None), select the one
+          with the highest `processed` value.
+        - Tie-breaker: When `processed` values are equal, prefer the one with higher `speed`.
+        - Fallback: If no prefill has both speed > 0 and eta is not None, use the first
+          prefill in iteration order.
+        """
         active_models = stats.get("active_models", {})
         models = active_models.get("models", [])
 
@@ -301,6 +309,7 @@ class OMLXAppDelegate(NSObject):
         prefill_count = 0
         best_prefill_processed = 0
         best_prefill_total = 0
+        best_prefill_speed = 0.0
 
         for model in models:
             for prefill in model.get("prefilling", []):
@@ -308,11 +317,19 @@ class OMLXAppDelegate(NSObject):
                 # Use the most informative prefill (has speed/eta)
                 speed = prefill.get("speed", 0.0)
                 eta = prefill.get("eta")
-                if speed > 0 and eta is not None and (best_prefill_processed == 0 or True):
-                    prefill_speed = speed
-                    prefill_eta = eta
-                    best_prefill_processed = prefill.get("processed", 0)
-                    best_prefill_total = prefill.get("total", 0)
+                current_processed = prefill.get("processed", 0)
+                
+                if speed > 0 and eta is not None:
+                    # Select prefill with highest processed value
+                    # Tie-breaker: if processed values are equal, prefer higher speed
+                    if (current_processed > best_prefill_processed) or (
+                        current_processed == best_prefill_processed and speed > best_prefill_speed
+                    ):
+                        prefill_speed = speed
+                        prefill_eta = eta
+                        best_prefill_processed = current_processed
+                        best_prefill_total = prefill.get("total", 0)
+                        best_prefill_speed = speed
 
         # If no prefill with speed/eta, use the first one
         if best_prefill_processed == 0 and prefill_count > 0:
