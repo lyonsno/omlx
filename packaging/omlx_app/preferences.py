@@ -47,7 +47,25 @@ LAUNCH_AGENT_DIR = Path.home() / "Library" / "LaunchAgents"
 LAUNCH_AGENT_PLIST = LAUNCH_AGENT_DIR / f"{LAUNCH_AGENT_LABEL}.plist"
 
 WINDOW_WIDTH = 520
-WINDOW_HEIGHT = 606
+WINDOW_HEIGHT = 688
+CARD_VERTICAL_GAP = 16
+SERVER_CARD_HEIGHT = 218
+BEHAVIOR_CARD_HEIGHT = 194
+ACTIONS_CARD_HEIGHT = 88
+
+
+def _behavior_refresh_row_positions(card_height: int = BEHAVIOR_CARD_HEIGHT) -> tuple[int, int]:
+    """Return the label/button y positions for the refresh controls within the behavior card."""
+    cy = card_height - 16
+    cy -= 20  # header
+    cy -= 26  # launch at login
+    cy -= 12  # separator
+    cy -= 26  # auto-start
+    cy -= 12  # separator
+    cy -= 26  # live metrics
+    cy -= 12  # separator
+    cy -= 26  # refresh label
+    return cy, cy - 2
 
 
 class PreferencesWindowController(NSObject):
@@ -66,6 +84,7 @@ class PreferencesWindowController(NSObject):
         self.window = None
         self.launch_at_login_checkbox = None
         self.auto_start_checkbox = None
+        self.live_metrics_checkbox = None
         self.base_path_label = None
         self.model_dir_label = None
         self.port_field = None
@@ -132,15 +151,17 @@ class PreferencesWindowController(NSObject):
         # === Server Settings Card ===
         y -= 46
         server_card = self._create_card()
-        server_card.setFrame_(NSMakeRect(24, y - 218, WINDOW_WIDTH - 48, 218))
+        server_card.setFrame_(
+            NSMakeRect(24, y - SERVER_CARD_HEIGHT, WINDOW_WIDTH - 48, SERVER_CARD_HEIGHT)
+        )
         container.addSubview_(server_card)
 
         server_content = NSView.alloc().initWithFrame_(
-            NSMakeRect(0, 0, WINDOW_WIDTH - 48, 218)
+            NSMakeRect(0, 0, WINDOW_WIDTH - 48, SERVER_CARD_HEIGHT)
         )
         server_card.setContentView_(server_content)
 
-        cy = 218 - 16
+        cy = SERVER_CARD_HEIGHT - 16
 
         # Header
         cy -= 20
@@ -279,19 +300,26 @@ class PreferencesWindowController(NSObject):
         )
         server_content.addSubview_(self._eye_btn)
 
-        y -= 234
+        y -= SERVER_CARD_HEIGHT + CARD_VERTICAL_GAP
 
         # === Behavior Card ===
         behavior_card = self._create_card()
-        behavior_card.setFrame_(NSMakeRect(24, y - 104, WINDOW_WIDTH - 48, 104))
+        behavior_card.setFrame_(
+            NSMakeRect(
+                24,
+                y - BEHAVIOR_CARD_HEIGHT,
+                WINDOW_WIDTH - 48,
+                BEHAVIOR_CARD_HEIGHT,
+            )
+        )
         container.addSubview_(behavior_card)
 
         behavior_content = NSView.alloc().initWithFrame_(
-            NSMakeRect(0, 0, WINDOW_WIDTH - 48, 104)
+            NSMakeRect(0, 0, WINDOW_WIDTH - 48, BEHAVIOR_CARD_HEIGHT)
         )
         behavior_card.setContentView_(behavior_content)
 
-        cy = 104 - 16
+        cy = BEHAVIOR_CARD_HEIGHT - 16
 
         # Header
         cy -= 20
@@ -337,19 +365,42 @@ class PreferencesWindowController(NSObject):
         )
         behavior_content.addSubview_(self.auto_start_checkbox)
 
-        y -= 120
+        # Separator
+        cy -= 12
+        sep4 = self._create_separator()
+        sep4.setFrame_(NSMakeRect(16, cy, WINDOW_WIDTH - 96, 1))
+        behavior_content.addSubview_(sep4)
+
+        # Live metrics
+        cy -= 26
+        self.live_metrics_checkbox = NSButton.alloc().initWithFrame_(
+            NSMakeRect(16, cy, WINDOW_WIDTH - 96, 20)
+        )
+        self.live_metrics_checkbox.setButtonType_(NSButtonTypeSwitch)
+        self.live_metrics_checkbox.setTitle_("Show live metrics in menu bar")
+        self.live_metrics_checkbox.setFont_(NSFont.systemFontOfSize_(12))
+        self.live_metrics_checkbox.setState_(
+            NSControlStateValueOn
+            if self.config.show_live_metrics_in_menu_bar
+            else NSControlStateValueOff
+        )
+        behavior_content.addSubview_(self.live_metrics_checkbox)
+
+        y -= BEHAVIOR_CARD_HEIGHT + CARD_VERTICAL_GAP
 
         # === Actions Card ===
         actions_card = self._create_card()
-        actions_card.setFrame_(NSMakeRect(24, y - 88, WINDOW_WIDTH - 48, 88))
+        actions_card.setFrame_(
+            NSMakeRect(24, y - ACTIONS_CARD_HEIGHT, WINDOW_WIDTH - 48, ACTIONS_CARD_HEIGHT)
+        )
         container.addSubview_(actions_card)
 
         actions_content = NSView.alloc().initWithFrame_(
-            NSMakeRect(0, 0, WINDOW_WIDTH - 48, 88)
+            NSMakeRect(0, 0, WINDOW_WIDTH - 48, ACTIONS_CARD_HEIGHT)
         )
         actions_card.setContentView_(actions_content)
 
-        cy = 88 - 16
+        cy = ACTIONS_CARD_HEIGHT - 16
 
         # Header
         cy -= 20
@@ -506,6 +557,9 @@ class PreferencesWindowController(NSObject):
             self.config.model_dir = ""
         self.config.launch_at_login = bool(self.launch_at_login_checkbox.state())
         self.config.start_server_on_launch = bool(self.auto_start_checkbox.state())
+        self.config.show_live_metrics_in_menu_bar = bool(
+            self.live_metrics_checkbox.state()
+        )
         self.config.save()
 
         # Save API key
@@ -615,6 +669,7 @@ class PreferencesWindowController(NSObject):
             self.config.model_dir = ""
             self.config.launch_at_login = False
             self.config.start_server_on_launch = False
+            self.config.show_live_metrics_in_menu_bar = False
             self.config.save()
 
             self.base_path_label.setStringValue_(defaults.base_path)
@@ -633,6 +688,7 @@ class PreferencesWindowController(NSObject):
                 self._eye_btn.setImage_(eye_icon)
             self.launch_at_login_checkbox.setState_(NSControlStateValueOff)
             self.auto_start_checkbox.setState_(NSControlStateValueOff)
+            self.live_metrics_checkbox.setState_(NSControlStateValueOff)
             self._original_base_path = defaults.base_path
 
             if self.on_save:

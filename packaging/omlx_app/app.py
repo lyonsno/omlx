@@ -21,6 +21,8 @@ from AppKit import (
     NSAttributedString,
     NSBundle,
     NSColor,
+    NSFont,
+    NSFontAttributeName,
     NSForegroundColorAttributeName,
     NSImage,
     NSMenu,
@@ -28,7 +30,15 @@ from AppKit import (
     NSStatusBar,
     NSVariableStatusItemLength,
 )
-from Foundation import NSData, NSDefaultRunLoopMode, NSObject, NSRunLoop, NSTimer
+from Foundation import (
+    NSData,
+    NSDefaultRunLoopMode,
+    NSMakeRange,
+    NSMutableAttributedString,
+    NSObject,
+    NSRunLoop,
+    NSTimer,
+)
 
 from omlx._version import __version__
 
@@ -36,6 +46,91 @@ from .config import ServerConfig
 from .server_manager import PortConflict, ServerManager, ServerStatus
 
 logger = logging.getLogger(__name__)
+
+LIVE_METRICS_STATUS_ITEM_WIDTH = 64
+
+
+def _compact_metric_value(value: int) -> str:
+    """Format live menubar values with a whole-number k suffix once they reach 1000."""
+    if value >= 1000:
+        return f"{max(1, value // 1000)}k"
+    return str(value)
+
+
+def _format_compact_generation_speed(speed: float) -> str:
+    """Format generation TPS as a compact badge string."""
+    import math
+
+    try:
+        numeric_speed = float(speed)
+    except (TypeError, ValueError):
+        numeric_speed = 0.0
+
+    if not math.isfinite(numeric_speed) or numeric_speed < 0:
+        numeric_speed = 0.0
+
+    rounded_tps = max(0, int(numeric_speed + 0.5))
+    return f"{_compact_metric_value(rounded_tps)} tok/s"
+
+
+def _get_menubar_badge(stats: dict) -> tuple[str, str]:
+    """Return the live menubar badge kind and title."""
+    active_models = stats.get("active_models", {})
+    models = active_models.get("models", [])
+
+    total_prefill_processed = 0
+    total_prefill_total = 0
+    has_prefill = False
+    for model in models:
+        for prefill in model.get("prefilling", []):
+            has_prefill = True
+            total_prefill_processed += max(0, int(prefill.get("processed", 0) or 0))
+            total_prefill_total += max(0, int(prefill.get("total", 0) or 0))
+
+    if has_prefill:
+        percent = 0
+        if total_prefill_total > 0:
+            percent = int((total_prefill_processed * 100 / total_prefill_total) + 0.5)
+            percent = min(100, max(0, percent))
+        return "prefill", f"{percent}%"
+
+    total_active = max(0, int(active_models.get("total_active_requests", 0) or 0))
+    total_waiting = max(
+        0, int(active_models.get("total_waiting_requests", 0) or 0)
+    )
+    if total_active > 0:
+        avg_tps = float(stats.get("avg_generation_tps", 0.0) or 0.0)
+        return "generation", _format_compact_generation_speed(avg_tps)
+
+    if total_waiting > 0:
+        return "queue", f"Q{_compact_metric_value(total_waiting)}"
+
+    return "idle", ""
+
+
+def _build_generation_attributed_title(title: str):
+    """Build an attributed generation badge with a smaller tok/s unit."""
+    if hasattr(NSFont, "monospacedDigitSystemFontOfSize_weight_"):
+        base_font = NSFont.monospacedDigitSystemFontOfSize_weight_(13, 0)
+    elif hasattr(NSFont, "systemFontOfSize_weight_"):
+        base_font = NSFont.systemFontOfSize_weight_(13, 0)
+    else:
+        base_font = NSFont.systemFontOfSize_(13)
+
+    unit_font = NSFont.systemFontOfSize_(11)
+    attributed = NSMutableAttributedString.alloc().initWithString_attributes_(
+        title, {NSFontAttributeName: base_font}
+    )
+
+    unit_start = title.find("tok/s")
+    if unit_start != -1:
+        attributed.addAttribute_value_range_(
+            NSFontAttributeName,
+            unit_font,
+            NSMakeRange(unit_start, len("tok/s")),
+        )
+
+    return attributed
 
 
 def _find_matching_dmg(assets: list[dict]) -> str | None:
@@ -89,6 +184,7 @@ class OMLXAppDelegate(NSObject):
         self._last_update_check: float = 0
         self._updater = None  # AppUpdater instance during download
         self._update_progress_text = ""  # Current download progress text
+        self._using_attributed_menubar_title = False
 
         return self
 
@@ -234,142 +330,77 @@ class OMLXAppDelegate(NSObject):
         return False
 
     def _update_menubar_icon(self):
-        """Update menubar icon based on server state and live activity.
+        """Update menubar icon based on server state.
 
         Template images automatically adapt to menubar background color,
         so we only need to switch between outline (OFF) and filled (ON).
-        When server is running with activity, display live monitoring text.
+        Live metrics are optional and use a compact single-badge title.
         """
         if self.status_item is None:
             return
 
         status = self.server_manager.status
-        is_running = status == ServerStatus.RUNNING
+        icon = (
+            self._icon_filled
+            if status in (ServerStatus.RUNNING, ServerStatus.STARTING)
+            else self._icon_outline
+        )
 
-        # Determine icon based on status and activity
-        has_live_activity = False
-        if is_running and self._cached_stats:
-            stats = self._cached_stats
-            active_models = stats.get("active_models", {})
-            total_active = active_models.get("total_active_requests", 0)
-            total_waiting = active_models.get("total_waiting_requests", 0)
-
-            # Check for prefill activity
-            models = active_models.get("models", [])
-            for model in models:
-                if model.get("prefilling", []):
-                    has_live_activity = True
-                    break
-
-            # Generation-only activity counts as live if there are requests or waiting
-            if not has_live_activity and (total_active > 0 or total_waiting > 0):
-                has_live_activity = True
-
-        # Icon: filled when server is RUNNING or STARTING; outline otherwise
-        icon = self._icon_filled if status in (ServerStatus.RUNNING, ServerStatus.STARTING) else self._icon_outline
-
-        # Title: show monitoring text only when running with live activity
         title = ""
-        if is_running and has_live_activity:
-            title = self._format_menubar_title(stats)
+        badge_kind = "idle"
+        show_live_metrics = bool(
+            getattr(self.config, "show_live_metrics_in_menu_bar", False)
+        )
+        if show_live_metrics and status == ServerStatus.RUNNING and self._cached_stats:
+            badge_kind, title = _get_menubar_badge(self._cached_stats)
+
+        self.status_item.setLength_(
+            LIVE_METRICS_STATUS_ITEM_WIDTH
+            if show_live_metrics and title
+            else NSVariableStatusItemLength
+        )
+
+        button = self.status_item.button()
+        if (
+            button
+            and getattr(self, "_using_attributed_menubar_title", False)
+            and badge_kind != "generation"
+        ):
+            button.setAttributedTitle_(
+                NSAttributedString.alloc().initWithString_attributes_("", {})
+            )
+            self._using_attributed_menubar_title = False
 
         if icon:
-            button = self.status_item.button()
             if button:
                 button.setImage_(icon)
-
-        if icon:
-            # When icon is set, title is either stats (if activity) or empty
-            self.status_item.setTitle_(title)
+            if badge_kind == "generation" and title and button:
+                button.setAttributedTitle_(_build_generation_attributed_title(title))
+                self._using_attributed_menubar_title = True
+                self.status_item.setTitle_("")
+            else:
+                self.status_item.setTitle_(title)
         else:
-            # Fallback to text if icons not available
-            # Show activity stats if available, otherwise "oMLX"
-            self.status_item.setTitle_(title if title else "oMLX")
+            # Fallback to text if icons are unavailable.
+            if badge_kind == "generation" and title and button:
+                button.setAttributedTitle_(_build_generation_attributed_title(title))
+                self._using_attributed_menubar_title = True
+                self.status_item.setTitle_("")
+            else:
+                self.status_item.setTitle_(title if title else "oMLX")
 
-   # --- Update checking ---
+    # --- Update checking ---
 
     def _format_menubar_title(self, stats: dict) -> str:
-        """Format monitoring text for menubar based on current activity.
-        
-        Prefill selection contract:
-        - Among informative prefills (speed > 0 AND eta is not None), select the one
-          with the highest `processed` value.
-        - Tie-breaker: When `processed` values are equal, prefer the one with higher `speed`.
-        - Fallback: If no prefill has both speed > 0 and eta is not None, use the first
-          prefill in iteration order.
+        """Format a compact single-signal menubar badge.
+
+        Priority order:
+        1. Aggregate prefill progress as a whole-percent badge.
+        2. Rounded generation throughput while requests are active.
+        3. Queue depth when backlog is the only live signal.
+        4. Empty title for idle state.
         """
-        active_models = stats.get("active_models", {})
-        models = active_models.get("models", [])
-
-        # Look for prefill activity across all models
-        total_prefill_processed = 0
-        total_prefill_total = 0
-        prefill_speed = 0.0
-        prefill_eta = None
-        prefill_count = 0
-        best_prefill_processed = 0
-        best_prefill_total = 0
-        best_prefill_speed = 0.0
-
-        for model in models:
-            for prefill in model.get("prefilling", []):
-                prefill_count += 1
-                # Use the most informative prefill (has speed/eta)
-                speed = prefill.get("speed", 0.0)
-                eta = prefill.get("eta")
-                current_processed = prefill.get("processed", 0)
-                
-                if speed > 0 and eta is not None:
-                    # Select prefill with highest processed value
-                    # Tie-breaker: if processed values are equal, prefer higher speed
-                    if (current_processed > best_prefill_processed) or (
-                        current_processed == best_prefill_processed and speed > best_prefill_speed
-                    ):
-                        prefill_speed = speed
-                        prefill_eta = eta
-                        best_prefill_processed = current_processed
-                        best_prefill_total = prefill.get("total", 0)
-                        best_prefill_speed = speed
-
-        # If no prefill with speed/eta, use the first one
-        if best_prefill_processed == 0 and prefill_count > 0:
-            for model in models:
-                for prefill in model.get("prefilling", []):
-                    best_prefill_processed = prefill.get("processed", 0)
-                    best_prefill_total = prefill.get("total", 0)
-                    break
-                if best_prefill_processed > 0:
-                    break
-
-        if prefill_count > 0:
-            # Format prefill progress
-            processed_str = self._format_token_count(best_prefill_processed)
-            total_str = self._format_token_count(best_prefill_total)
-            speed_str = self._format_speed(prefill_speed) if prefill_speed > 0 else ""
-            eta_str = self._format_eta(prefill_eta) if prefill_eta is not None else ""
-
-            parts = [f"{prefill_count} PP", f"{processed_str}/{total_str} tok"]
-            if speed_str:
-                parts.append(speed_str)
-            if eta_str:
-                parts.append(eta_str)
-            return " ".join(parts)
-
-        # No prefill - show generation activity
-        total_active = active_models.get("total_active_requests", 0)
-        total_waiting = active_models.get("total_waiting_requests", 0)
-        avg_tps = stats.get("avg_generation_tps", 0.0)
-
-        parts = []
-        if total_active > 0:
-            parts.append(f"{total_active} req")
-        if total_waiting > 0:
-            parts.append(f"{total_waiting} wait")
-        # Only show TPS if there is active generation (total_active > 0)
-        if avg_tps > 0 and total_active > 0:
-            parts.append(f"{avg_tps:.1f} tok/s")
-
-        return " ".join(parts) if parts else ""
+        return _get_menubar_badge(stats)[1]
 
     def _format_token_count(self, count: int) -> str:
         """Format token count with appropriate suffix (k, M, etc)."""
@@ -382,6 +413,10 @@ class OMLXAppDelegate(NSObject):
 
     def _format_speed(self, speed: float) -> str:
         """Format speed with appropriate suffix."""
+        import math
+
+        if math.isnan(speed) or math.isinf(speed) or speed < 0:
+            return "N/A"
         if speed >= 1000:
             return f"{speed / 1000:.0f}k tok/s"
         else:
@@ -389,6 +424,10 @@ class OMLXAppDelegate(NSObject):
 
     def _format_eta(self, seconds: float) -> str:
         """Format ETA in human-readable format."""
+        import math
+
+        if math.isnan(seconds) or math.isinf(seconds) or seconds < 0:
+            return "N/A"
         if seconds < 60:
             return f"{round(seconds)}s"
         elif seconds < 3600:
@@ -1121,7 +1160,7 @@ class OMLXAppDelegate(NSObject):
     def _on_prefs_saved(self):
         """Callback after preferences are saved."""
         self.server_manager.update_config(self.config)
-        self._build_menu()
+        self._update_status_display()
 
     @objc.IBAction
     def showAbout_(self, sender):

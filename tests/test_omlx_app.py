@@ -37,6 +37,7 @@ class TestServerConfig:
         assert config.model_dir == ""
         assert config.launch_at_login is False
         assert config.start_server_on_launch is False
+        assert config.show_live_metrics_in_menu_bar is False
 
     def test_custom_values(self):
         """Test ServerConfig with custom values."""
@@ -46,12 +47,14 @@ class TestServerConfig:
             model_dir="/path/to/models",
             launch_at_login=True,
             start_server_on_launch=True,
+            show_live_metrics_in_menu_bar=True,
         )
         assert config.base_path == "/custom/base"
         assert config.port == 9000
         assert config.model_dir == "/path/to/models"
         assert config.launch_at_login is True
         assert config.start_server_on_launch is True
+        assert config.show_live_metrics_in_menu_bar is True
 
     def test_to_dict(self):
         """Test ServerConfig.to_dict() method."""
@@ -68,9 +71,11 @@ class TestServerConfig:
         assert result["model_dir"] == "/models"
         expected_keys = {
             "base_path", "port", "model_dir",
-            "launch_at_login", "start_server_on_launch"
+            "launch_at_login", "start_server_on_launch",
+            "show_live_metrics_in_menu_bar",
         }
         assert set(result.keys()) == expected_keys
+        assert result["show_live_metrics_in_menu_bar"] is False
 
     def test_from_dict(self):
         """Test ServerConfig.from_dict() method."""
@@ -80,6 +85,7 @@ class TestServerConfig:
             "model_dir": "/custom/models",
             "launch_at_login": True,
             "start_server_on_launch": False,
+            "show_live_metrics_in_menu_bar": True,
         }
         config = ServerConfig.from_dict(data)
 
@@ -88,6 +94,7 @@ class TestServerConfig:
         assert config.model_dir == "/custom/models"
         assert config.launch_at_login is True
         assert config.start_server_on_launch is False
+        assert config.show_live_metrics_in_menu_bar is True
 
     def test_from_dict_ignores_unknown_keys(self):
         """Test that from_dict ignores unknown keys."""
@@ -112,6 +119,7 @@ class TestServerConfig:
         assert config.port == 9999
         assert config.base_path == str(Path.home() / ".omlx")  # default
         assert config.model_dir == ""  # default
+        assert config.show_live_metrics_in_menu_bar is False
 
     def test_save_and_load(self, tmp_path: Path):
         """Test save and load round-trip."""
@@ -122,6 +130,7 @@ class TestServerConfig:
                 base_path="/test/base",
                 port=8888,
                 model_dir="/test/models",
+                show_live_metrics_in_menu_bar=True,
             )
             original.save()
 
@@ -131,6 +140,10 @@ class TestServerConfig:
             assert loaded.base_path == original.base_path
             assert loaded.port == original.port
             assert loaded.model_dir == original.model_dir
+            assert (
+                loaded.show_live_metrics_in_menu_bar
+                == original.show_live_metrics_in_menu_bar
+            )
 
     def test_load_returns_default_on_missing_file(self, tmp_path: Path):
         """Test load returns default config when file doesn't exist."""

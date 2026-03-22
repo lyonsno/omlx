@@ -43,6 +43,7 @@ class ServerConfig:
     model_dir: str = ""  # Empty string means use default: {base_path}/models
     launch_at_login: bool = False
     start_server_on_launch: bool = False
+    show_live_metrics_in_menu_bar: bool = False
 
     def get_effective_model_dir(self) -> str:
         """Get the model directory, using base_path/models if not specified."""

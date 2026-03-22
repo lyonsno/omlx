@@ -1,11 +1,11 @@
-"""Targeted tests for menubar monitoring text in the native app."""
+"""Targeted tests for compact menubar metrics in the native app."""
 
 import importlib.util
 import sys
 import types
 from enum import Enum
 from pathlib import Path
-from unittest.mock import Mock, MagicMock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -38,10 +38,49 @@ def app_module():
         "omlx_app",
         "omlx_app.config",
         "omlx_app.server_manager",
+        "omlx_app.updater",
         "omlx_app.app",
     ]
     for name in module_names:
         saved[name] = sys.modules.get(name)
+
+    class FakeFont:
+        def __init__(self, size, family="system", weight=None):
+            self.size = size
+            self.family = family
+            self.weight = weight
+
+        @classmethod
+        def systemFontOfSize_(cls, size):
+            return cls(size, family="system")
+
+        @classmethod
+        def systemFontOfSize_weight_(cls, size, weight):
+            return cls(size, family="system", weight=weight)
+
+        @classmethod
+        def monospacedDigitSystemFontOfSize_weight_(cls, size, weight):
+            return cls(size, family="monospaced-digit", weight=weight)
+
+    class FakeAttributedString:
+        def __init__(self):
+            self.string = ""
+            self.base_attributes = {}
+            self.range_attributes = []
+
+        @classmethod
+        def alloc(cls):
+            return cls()
+
+        def initWithString_attributes_(self, string, attributes):
+            self.string = string
+            self.base_attributes = dict(attributes or {})
+            return self
+
+    class FakeMutableAttributedString(FakeAttributedString):
+        def addAttribute_value_range_(self, name, value, ns_range):
+            self.range_attributes.append((name, value, ns_range))
+            return self
 
     appkit = types.ModuleType("AppKit")
     appkit.NSApp = MagicMock()
@@ -49,9 +88,11 @@ def app_module():
     appkit.NSApplication = MagicMock()
     appkit.NSApplicationActivationPolicyAccessory = 1
     appkit.NSApplicationActivationPolicyRegular = 0
-    appkit.NSAttributedString = MagicMock()
+    appkit.NSAttributedString = FakeAttributedString
     appkit.NSBundle = MagicMock()
     appkit.NSColor = MagicMock()
+    appkit.NSFont = FakeFont
+    appkit.NSFontAttributeName = "font"
     appkit.NSForegroundColorAttributeName = "foreground"
     appkit.NSImage = MagicMock()
     appkit.NSMenu = MagicMock()
@@ -64,11 +105,14 @@ def app_module():
     foundation.NSObject = object
     foundation.NSRunLoop = MagicMock()
     foundation.NSDefaultRunLoopMode = "default"
+    foundation.NSMakeRange = lambda start, length: (start, length)
+    foundation.NSMutableAttributedString = FakeMutableAttributedString
     foundation.NSTimer = MagicMock()
 
     objc_mod = types.ModuleType("objc")
     objc_mod.super = super
     objc_mod.IBAction = lambda fn: fn
+    objc_mod.selector = lambda fn, signature=None: fn
 
     fake_omlx = types.ModuleType("omlx")
     fake_omlx.__path__ = []
@@ -79,8 +123,14 @@ def app_module():
     fake_package.__path__ = [str(APP_DIR)]
     fake_config = types.ModuleType("omlx_app.config")
     fake_server_manager = types.ModuleType("omlx_app.server_manager")
+    fake_updater = types.ModuleType("omlx_app.updater")
 
     class FakeServerConfig:
+        def __init__(self):
+            self.stats_refresh_interval = 5
+            self.is_first_run = False
+            self.start_server_on_launch = False
+
         @classmethod
         def load(cls):
             return cls()
@@ -105,6 +155,7 @@ def app_module():
     fake_server_manager.PortConflict = FakePortConflict
     fake_server_manager.ServerManager = FakeServerManager
     fake_server_manager.ServerStatus = FakeServerStatus
+    fake_updater.AppUpdater = types.SimpleNamespace(cleanup_staged_app=Mock())
 
     try:
         sys.modules["AppKit"] = appkit
@@ -115,6 +166,7 @@ def app_module():
         sys.modules["omlx_app"] = fake_package
         sys.modules["omlx_app.config"] = fake_config
         sys.modules["omlx_app.server_manager"] = fake_server_manager
+        sys.modules["omlx_app.updater"] = fake_updater
         yield _load_module("omlx_app.app", APP_DIR / "app.py")
     finally:
         for name, value in saved.items():
@@ -124,21 +176,145 @@ def app_module():
                 sys.modules[name] = value
 
 
+@pytest.fixture
+def preferences_module():
+    """Import the real preferences module with only its direct dependencies mocked."""
+    saved = {}
+    module_names = [
+        "AppKit",
+        "Foundation",
+        "objc",
+        "omlx_app",
+        "omlx_app.widgets",
+        "omlx_app.preferences",
+    ]
+    for name in module_names:
+        saved[name] = sys.modules.get(name)
+
+    class FakeFont:
+        def __init__(self, size, family="system", weight=None):
+            self.size = size
+            self.family = family
+            self.weight = weight
+
+        @classmethod
+        def systemFontOfSize_(cls, size):
+            return cls(size, family="system")
+
+        @classmethod
+        def systemFontOfSize_weight_(cls, size, weight):
+            return cls(size, family="system", weight=weight)
+
+        @classmethod
+        def monospacedSystemFontOfSize_weight_(cls, size, weight):
+            return cls(size, family="monospaced", weight=weight)
+
+    class FakeColor:
+        @staticmethod
+        def controlAccentColor():
+            return "accent"
+
+        @staticmethod
+        def secondaryLabelColor():
+            return "secondary"
+
+        @staticmethod
+        def labelColor():
+            return "label"
+
+        @staticmethod
+        def tertiaryLabelColor():
+            return "tertiary"
+
+    appkit = types.ModuleType("AppKit")
+    appkit.NSAlert = MagicMock()
+    appkit.NSAlertFirstButtonReturn = 1000
+    appkit.NSAlertStyleCritical = 2
+    appkit.NSAlertStyleWarning = 1
+    appkit.NSApp = MagicMock()
+    appkit.NSBackingStoreBuffered = 2
+    appkit.NSBezelStyleRounded = 1
+    appkit.NSBox = MagicMock()
+    appkit.NSBoxCustom = 1
+    appkit.NSBoxSeparator = 2
+    appkit.NSButton = MagicMock()
+    appkit.NSButtonTypeSwitch = 3
+    appkit.NSColor = FakeColor
+    appkit.NSControlStateValueOff = 0
+    appkit.NSControlStateValueOn = 1
+    appkit.NSFont = FakeFont
+    appkit.NSImage = MagicMock()
+    appkit.NSMakeRect = lambda *args: args
+    appkit.NSOpenPanel = MagicMock()
+    appkit.NSTextField = MagicMock()
+    appkit.NSView = MagicMock()
+    appkit.NSVisualEffectBlendingModeBehindWindow = 1
+    appkit.NSVisualEffectMaterialSidebar = 1
+    appkit.NSVisualEffectView = MagicMock()
+    appkit.NSWindow = MagicMock()
+    appkit.NSWindowStyleMaskClosable = 1
+    appkit.NSWindowStyleMaskTitled = 2
+
+    foundation = types.ModuleType("Foundation")
+    foundation.NSObject = object
+
+    objc_mod = types.ModuleType("objc")
+    objc_mod.super = super
+    objc_mod.IBAction = lambda fn: fn
+    objc_mod.selector = lambda fn, signature=None: fn
+
+    fake_package = types.ModuleType("omlx_app")
+    fake_package.__path__ = [str(APP_DIR)]
+    fake_widgets = types.ModuleType("omlx_app.widgets")
+
+    class FakePastableSecureTextField:
+        pass
+
+    fake_widgets.PastableSecureTextField = FakePastableSecureTextField
+
+    try:
+        sys.modules["AppKit"] = appkit
+        sys.modules["Foundation"] = foundation
+        sys.modules["objc"] = objc_mod
+        sys.modules["omlx_app"] = fake_package
+        sys.modules["omlx_app.widgets"] = fake_widgets
+        yield _load_module("omlx_app.preferences", APP_DIR / "preferences.py")
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = value
+
+
 class TestMenubarMonitoring:
-    """Tests for live menubar monitoring text in the native app."""
+    """Tests for compact live menubar metrics in the native app."""
 
     @staticmethod
-    def _make_delegate(app_module, stats, status):
+    def _make_delegate(
+        app_module,
+        stats,
+        status,
+        *,
+        show_live_metrics=False,
+        icons_available=True,
+    ):
         button = Mock()
         status_item = Mock()
         status_item.button.return_value = button
         delegate = types.SimpleNamespace(
             status_item=status_item,
             server_manager=types.SimpleNamespace(status=status),
-            _icon_outline="outline-icon",
-            _icon_filled="filled-icon",
+            config=types.SimpleNamespace(
+                show_live_metrics_in_menu_bar=show_live_metrics
+            ),
+            _icon_outline="outline-icon" if icons_available else None,
+            _icon_filled="filled-icon" if icons_available else None,
             _cached_stats=stats,
         )
+        assert (
+            delegate.config.show_live_metrics_in_menu_bar == show_live_metrics
+        ), "Delegate fixture failed to wire the live-metrics opt-in flag"
         for method_name in (
             "_format_menubar_title",
             "_format_token_count",
@@ -163,124 +339,67 @@ class TestMenubarMonitoring:
     def _assert_final_icon(self, button, expected_icon):
         assert self._last_single_arg(button.setImage_) == expected_icon
 
-    def _assert_title_fragments(
-        self,
-        status_item,
-        *,
-        includes=(),
-        excludes=(),
-        exact=None,
-    ):
-        title = self._last_single_arg(status_item.setTitle_)
-        if exact is not None:
-            assert title == exact
-            return
-        for fragment in includes:
-            assert fragment in title
-        for fragment in excludes:
-            assert fragment not in title
+    def _assert_displayed_title(self, status_item, button, expected_title):
+        if button.setAttributedTitle_.call_args_list:
+            attributed = self._last_single_arg(button.setAttributedTitle_)
+            assert attributed.string == expected_title
+            assert self._last_single_arg(status_item.setTitle_) == ""
+            return attributed
 
-    def test_update_menubar_icon_prefers_live_prefill_progress(self, app_module):
-        """Prefill activity should surface compact token/speed/ETA monitoring."""
-        stats = {
-            "avg_generation_tps": 78.4,
-            "active_models": {
-                "total_active_requests": 2,
-                "total_waiting_requests": 1,
-                "models": [
-                    {
-                        "id": "mlx-community/Qwen3-Coder-30B-A3B",
-                        "active_requests": 1,
-                        "waiting_requests": 1,
-                        "prefilling": [
-                            {
-                                "request_id": "req-123",
-                                "processed": 12345,
-                                "total": 67890,
-                                "speed": 511.6,
-                                "eta": 65.4,
-                            }
-                        ],
-                    }
-                ],
-            },
-        }
-        delegate, status_item, button = self._make_delegate(
-            app_module, stats, app_module.ServerStatus.RUNNING
+        assert self._last_single_arg(status_item.setTitle_) == expected_title
+        return None
+
+    def _assert_variable_width(self, status_item, app_module):
+        assert (
+            self._last_single_arg(status_item.setLength_)
+            == app_module.NSVariableStatusItemLength
         )
 
-        app_module.OMLXAppDelegate._update_menubar_icon(delegate)
+    def _minimum_live_metric_width(self, title: str) -> int:
+        """Conservative floor derived from the widest compact badge string."""
+        return 18 + (len(title) * 5)
 
-        self._assert_final_icon(button, "filled-icon")
-        self._assert_title_fragments(
-            status_item,
-            includes=("1 PP", "12.3k/67.9k tok", "512 tok/s", "1m 5s"),
-            excludes=("None", "req", "wait", "78.4 tok/s"),
-        )
+    def _assert_fixed_width(self, status_item, app_module, minimum_width=None):
+        length = self._last_single_arg(status_item.setLength_)
+        assert isinstance(length, (int, float))
+        assert length > 0
+        assert length != app_module.NSVariableStatusItemLength
+        if minimum_width is not None:
+            assert length >= minimum_width
+        return length
 
-    def test_update_menubar_icon_finds_prefill_beyond_first_model_row(self, app_module):
-        """Prefill should win even when the first model row has only generation/backlog state."""
+    def _assert_generation_unit_is_deemphasized(self, attributed, expected_title):
+        unit_start = expected_title.index("tok/s")
+        unit_range = (unit_start, len("tok/s"))
+        base_font = attributed.base_attributes.get("font")
+        assert base_font is not None
+        unit_font = None
+        for name, value, ns_range in attributed.range_attributes:
+            if name == "font" and ns_range == unit_range:
+                unit_font = value
+                break
+        assert unit_font is not None
+        assert unit_font.size < base_font.size
+
+    def test_live_metrics_are_opt_in_even_when_activity_exists(self, app_module):
+        """The default behavior should remain icon-only even with live server activity."""
         stats = {
-            "avg_generation_tps": 78.4,
+            "avg_generation_tps": 78.6,
             "active_models": {
                 "total_active_requests": 2,
                 "total_waiting_requests": 3,
                 "models": [
                     {
                         "id": "mlx-community/Qwen3-32B",
-                        "active_requests": 2,
+                        "active_requests": 1,
                         "waiting_requests": 2,
-                        "prefilling": [],
-                    },
-                    {
-                        "id": "mlx-community/Qwen3-14B",
-                        "active_requests": 0,
-                        "waiting_requests": 1,
                         "prefilling": [
                             {
-                                "request_id": "req-late",
-                                "processed": 4096,
-                                "total": 16384,
-                                "speed": 256.2,
-                                "eta": 48.8,
-                            }
-                        ],
-                    },
-                ],
-            },
-        }
-        delegate, status_item, button = self._make_delegate(
-            app_module, stats, app_module.ServerStatus.RUNNING
-        )
-
-        app_module.OMLXAppDelegate._update_menubar_icon(delegate)
-
-        self._assert_final_icon(button, "filled-icon")
-        self._assert_title_fragments(
-            status_item,
-            includes=("1 PP", "4.1k/16.4k tok", "256 tok/s", "49s"),
-            excludes=("req", "wait", "78.4 tok/s"),
-        )
-
-    def test_update_menubar_icon_omits_speed_and_eta_for_first_prefill_sample(self, app_module):
-        """First prefill observation should not render placeholder speed/ETA text."""
-        stats = {
-            "avg_generation_tps": 78.4,
-            "active_models": {
-                "total_active_requests": 0,
-                "total_waiting_requests": 1,
-                "models": [
-                    {
-                        "id": "mlx-community/Qwen3-Coder-30B-A3B",
-                        "active_requests": 0,
-                        "waiting_requests": 1,
-                        "prefilling": [
-                            {
-                                "request_id": "req-boot",
-                                "processed": 512,
-                                "total": 8000,
-                                "speed": 0.0,
-                                "eta": None,
+                                "request_id": "req-1",
+                                "processed": 1500,
+                                "total": 3000,
+                                "speed": 300.0,
+                                "eta": 5.0,
                             }
                         ],
                     }
@@ -288,115 +407,156 @@ class TestMenubarMonitoring:
             },
         }
         delegate, status_item, button = self._make_delegate(
-            app_module, stats, app_module.ServerStatus.RUNNING
+            app_module,
+            stats,
+            app_module.ServerStatus.RUNNING,
+            show_live_metrics=False,
         )
 
         app_module.OMLXAppDelegate._update_menubar_icon(delegate)
 
         self._assert_final_icon(button, "filled-icon")
-        self._assert_title_fragments(
-            status_item,
-            includes=("1 PP", "512/8.0k tok"),
-            excludes=("tok/s", "None", "left", "req", "wait"),
-        )
+        self._assert_variable_width(status_item, app_module)
+        self._assert_displayed_title(status_item, button, "")
 
-    def test_update_menubar_icon_handles_multiple_prefills_for_one_model(self, app_module):
-        """Concurrent prefills should show the aggregate count and the most informative request."""
+    def test_prefill_shows_aggregate_percentage_when_enabled(self, app_module):
+        """Prefill should surface raw aggregate progress with no prefix."""
         stats = {
-            "avg_generation_tps": 78.4,
+            "avg_generation_tps": 78.6,
             "active_models": {
-                "total_active_requests": 0,
-                "total_waiting_requests": 2,
+                "total_active_requests": 2,
+                "total_waiting_requests": 4,
                 "models": [
                     {
-                        "id": "mlx-community/Qwen3-Coder-30B-A3B",
-                        "active_requests": 0,
+                        "id": "model-a",
+                        "active_requests": 1,
                         "waiting_requests": 2,
                         "prefilling": [
                             {
-                                "request_id": "req-cold",
-                                "processed": 256,
-                                "total": 4096,
-                                "speed": 0.0,
-                                "eta": None,
-                            },
-                            {
-                                "request_id": "req-hot",
-                                "processed": 2048,
-                                "total": 8192,
-                                "speed": 300.4,
-                                "eta": 19.6,
-                            },
+                                "request_id": "req-a",
+                                "processed": 600,
+                                "total": 1000,
+                                "speed": 240.0,
+                                "eta": 1.7,
+                            }
                         ],
-                    }
+                    },
+                    {
+                        "id": "model-b",
+                        "active_requests": 1,
+                        "waiting_requests": 2,
+                        "prefilling": [
+                            {
+                                "request_id": "req-b",
+                                "processed": 1400,
+                                "total": 4000,
+                                "speed": 280.0,
+                                "eta": 9.3,
+                            }
+                        ],
+                    },
                 ],
             },
         }
         delegate, status_item, button = self._make_delegate(
-            app_module, stats, app_module.ServerStatus.RUNNING
+            app_module,
+            stats,
+            app_module.ServerStatus.RUNNING,
+            show_live_metrics=True,
         )
 
         app_module.OMLXAppDelegate._update_menubar_icon(delegate)
 
         self._assert_final_icon(button, "filled-icon")
-        self._assert_title_fragments(
-            status_item,
-            includes=("2 PP", "2.0k/8.2k tok", "300 tok/s", "20s"),
-            excludes=("256/4.1k tok", "None", "req", "wait"),
-        )
+        self._assert_displayed_title(status_item, button, "40%")
 
-    def test_update_menubar_icon_shows_live_request_counts_when_generating(self, app_module):
-        """Generation-only activity should use aggregate load, not the first model row."""
+    def test_generation_shows_compact_k_badge_with_smaller_unit(self, app_module):
+        """Generation should use an attributed compact badge so the unit can be deemphasized."""
         stats = {
-            "avg_generation_tps": 78.4,
+            "avg_generation_tps": 1024.6,
             "active_models": {
                 "total_active_requests": 3,
                 "total_waiting_requests": 4,
                 "models": [
                     {
-                        "id": "mlx-community/Qwen3-32B",
+                        "id": "model-a",
                         "active_requests": 2,
                         "waiting_requests": 1,
                         "prefilling": [],
                     },
                     {
-                        "id": "mlx-community/Qwen3-14B",
+                        "id": "model-b",
                         "active_requests": 1,
                         "waiting_requests": 3,
+                        "prefilling": [],
+                    },
+                ],
+            },
+        }
+        delegate, status_item, button = self._make_delegate(
+            app_module,
+            stats,
+            app_module.ServerStatus.RUNNING,
+            show_live_metrics=True,
+        )
+
+        app_module.OMLXAppDelegate._update_menubar_icon(delegate)
+
+        self._assert_final_icon(button, "filled-icon")
+        attributed = self._assert_displayed_title(status_item, button, "1k tok/s")
+        assert attributed is not None
+        self._assert_generation_unit_is_deemphasized(attributed, "1k tok/s")
+
+    @pytest.mark.parametrize("bad_tps", [float("nan"), float("inf"), float("-inf")])
+    def test_generation_non_finite_tps_degrades_to_zero_badge(
+        self, app_module, bad_tps
+    ):
+        """Malformed generation TPS values should not crash the menubar update."""
+        stats = {
+            "avg_generation_tps": bad_tps,
+            "active_models": {
+                "total_active_requests": 1,
+                "total_waiting_requests": 0,
+                "models": [
+                    {
+                        "id": "model-a",
+                        "active_requests": 1,
+                        "waiting_requests": 0,
                         "prefilling": [],
                     }
                 ],
             },
         }
         delegate, status_item, button = self._make_delegate(
-            app_module, stats, app_module.ServerStatus.RUNNING
+            app_module,
+            stats,
+            app_module.ServerStatus.RUNNING,
+            show_live_metrics=True,
         )
 
         app_module.OMLXAppDelegate._update_menubar_icon(delegate)
 
         self._assert_final_icon(button, "filled-icon")
-        self._assert_title_fragments(
-            status_item,
-            includes=("3 req", "4 wait", "78.4 tok/s"),
-            excludes=("PP", "12.3k/67.9k tok", "512/8.0k tok"),
-        )
+        attributed = self._assert_displayed_title(status_item, button, "0 tok/s")
+        assert attributed is not None
+        self._assert_generation_unit_is_deemphasized(attributed, "0 tok/s")
 
-    def test_update_menubar_icon_shows_queue_only_backlog_as_live_signal(self, app_module):
-        """A pure waiting backlog should not collapse to idle or display stale speed."""
+    def test_queue_only_shows_compact_queue_badge_when_enabled(self, app_module):
+        """Queue depth should only appear when backlog is the only live signal."""
         stats = {
-            "avg_generation_tps": 78.4,
+            "avg_generation_tps": 78.6,
             "active_models": {
                 "total_active_requests": 0,
                 "total_waiting_requests": 4,
                 "models": [
                     {
-                        "id": "mlx-community/Qwen3-32B",
+                        "id": "model-a",
                         "active_requests": 0,
                         "waiting_requests": 1,
                         "prefilling": [],
                     },
                     {
-                        "id": "mlx-community/Qwen3-14B",
+                        "id": "model-b",
                         "active_requests": 0,
                         "waiting_requests": 3,
                         "prefilling": [],
@@ -405,28 +565,27 @@ class TestMenubarMonitoring:
             },
         }
         delegate, status_item, button = self._make_delegate(
-            app_module, stats, app_module.ServerStatus.RUNNING
+            app_module,
+            stats,
+            app_module.ServerStatus.RUNNING,
+            show_live_metrics=True,
         )
 
         app_module.OMLXAppDelegate._update_menubar_icon(delegate)
 
         self._assert_final_icon(button, "filled-icon")
-        self._assert_title_fragments(
-            status_item,
-            includes=("4 wait",),
-            excludes=("idle", "tok/s", "PP", "req"),
-        )
+        self._assert_displayed_title(status_item, button, "Q4")
 
-    def test_update_menubar_icon_stays_compact_when_no_live_activity(self, app_module):
-        """Idle servers should keep the icon-only menubar presentation."""
+    def test_enabled_metrics_stay_compact_when_idle(self, app_module):
+        """Even when enabled, idle servers should keep the icon-only presentation."""
         stats = {
-            "avg_generation_tps": 78.4,
+            "avg_generation_tps": 78.6,
             "active_models": {
                 "total_active_requests": 0,
                 "total_waiting_requests": 0,
                 "models": [
                     {
-                        "id": "mlx-community/Qwen3-32B",
+                        "id": "model-a",
                         "active_requests": 0,
                         "waiting_requests": 0,
                         "prefilling": [],
@@ -435,24 +594,28 @@ class TestMenubarMonitoring:
             },
         }
         delegate, status_item, button = self._make_delegate(
-            app_module, stats, app_module.ServerStatus.RUNNING
+            app_module,
+            stats,
+            app_module.ServerStatus.RUNNING,
+            show_live_metrics=True,
         )
 
         app_module.OMLXAppDelegate._update_menubar_icon(delegate)
 
         self._assert_final_icon(button, "filled-icon")
-        self._assert_title_fragments(status_item, exact="")
+        self._assert_variable_width(status_item, app_module)
+        self._assert_displayed_title(status_item, button, "")
 
-    def test_update_menubar_icon_clears_stale_monitoring_while_starting(self, app_module):
-        """STARTING should not reuse stale live-monitor text from a previous run."""
+    def test_starting_clears_stale_metrics_even_when_enabled(self, app_module):
+        """STARTING should not reuse stale metrics from a previous run."""
         stats = {
-            "avg_generation_tps": 78.4,
+            "avg_generation_tps": 78.6,
             "active_models": {
                 "total_active_requests": 3,
                 "total_waiting_requests": 4,
                 "models": [
                     {
-                        "id": "mlx-community/Qwen3-32B",
+                        "id": "model-a",
                         "active_requests": 3,
                         "waiting_requests": 4,
                         "prefilling": [],
@@ -461,30 +624,32 @@ class TestMenubarMonitoring:
             },
         }
         delegate, status_item, button = self._make_delegate(
-            app_module, stats, app_module.ServerStatus.STARTING
+            app_module,
+            stats,
+            app_module.ServerStatus.STARTING,
+            show_live_metrics=True,
         )
 
         app_module.OMLXAppDelegate._update_menubar_icon(delegate)
 
         self._assert_final_icon(button, "filled-icon")
-        self._assert_title_fragments(status_item, exact="")
+        self._assert_variable_width(status_item, app_module)
+        self._assert_displayed_title(status_item, button, "")
 
     @pytest.mark.parametrize(
         "status_name",
         ["STOPPED", "STOPPING", "ERROR", "UNRESPONSIVE"],
     )
-    def test_update_menubar_icon_clears_stale_monitoring_when_server_is_not_running(
-        self, app_module, status_name
-    ):
-        """Cached monitoring text must disappear for any non-running server state."""
+    def test_non_running_states_clear_stale_metrics(self, app_module, status_name):
+        """Non-running states should stay metric-free even with cached stats."""
         stats = {
-            "avg_generation_tps": 78.4,
+            "avg_generation_tps": 78.6,
             "active_models": {
                 "total_active_requests": 3,
                 "total_waiting_requests": 4,
                 "models": [
                     {
-                        "id": "mlx-community/Qwen3-32B",
+                        "id": "model-a",
                         "active_requests": 3,
                         "waiting_requests": 4,
                         "prefilling": [],
@@ -494,18 +659,20 @@ class TestMenubarMonitoring:
         }
         status = getattr(app_module.ServerStatus, status_name)
         delegate, status_item, button = self._make_delegate(
-            app_module, stats, status
+            app_module,
+            stats,
+            status,
+            show_live_metrics=True,
         )
 
         app_module.OMLXAppDelegate._update_menubar_icon(delegate)
 
         self._assert_final_icon(button, "outline-icon")
-        self._assert_title_fragments(status_item, exact="")
+        self._assert_variable_width(status_item, app_module)
+        self._assert_displayed_title(status_item, button, "")
 
-    def test_update_menubar_icon_falls_back_to_oMLX_text_when_icons_missing_and_idle(
-        self, app_module
-    ):
-        """When icons fail to load and server is idle, menu bar should show 'oMLX' fallback."""
+    def test_missing_icons_fall_back_to_omlx_when_metrics_disabled(self, app_module):
+        """Missing icons should still leave a visible fallback when metrics are off."""
         stats = {
             "avg_generation_tps": 0.0,
             "active_models": {
@@ -515,301 +682,143 @@ class TestMenubarMonitoring:
             },
         }
         delegate, status_item, button = self._make_delegate(
-            app_module, stats, app_module.ServerStatus.STOPPED
+            app_module,
+            stats,
+            app_module.ServerStatus.STOPPED,
+            show_live_metrics=False,
+            icons_available=False,
         )
-        # Simulate failed icon loading
-        delegate._icon_outline = None
-        delegate._icon_filled = None
 
         app_module.OMLXAppDelegate._update_menubar_icon(delegate)
 
-        # No icon should be set when both are None
         button.setImage_.assert_not_called()
-        # Fallback text should be "oMLX"
-        self._assert_title_fragments(status_item, exact="oMLX")
+        self._assert_variable_width(status_item, app_module)
+        self._assert_displayed_title(status_item, button, "oMLX")
 
-    def test_update_menubar_icon_shows_stats_text_when_icons_missing_but_active(
-        self, app_module
-    ):
-        """When icons fail to load but server has activity, menu bar should show stats as text."""
+    def test_missing_icons_fall_back_to_compact_metric_when_enabled(self, app_module):
+        """Missing icons should still use the compact generation badge text."""
         stats = {
-            "avg_generation_tps": 50.5,
+            "avg_generation_tps": 1024.6,
             "active_models": {
-                "total_active_requests": 2,
-                "total_waiting_requests": 1,
-                "models": [],
+                "total_active_requests": 3,
+                "total_waiting_requests": 4,
+                "models": [
+                    {
+                        "id": "model-a",
+                        "active_requests": 2,
+                        "waiting_requests": 1,
+                        "prefilling": [],
+                    },
+                    {
+                        "id": "model-b",
+                        "active_requests": 1,
+                        "waiting_requests": 3,
+                        "prefilling": [],
+                    },
+                ],
             },
         }
         delegate, status_item, button = self._make_delegate(
-            app_module, stats, app_module.ServerStatus.RUNNING
+            app_module,
+            stats,
+            app_module.ServerStatus.RUNNING,
+            show_live_metrics=True,
+            icons_available=False,
         )
-        # Simulate failed icon loading
-        delegate._icon_outline = None
-        delegate._icon_filled = None
 
         app_module.OMLXAppDelegate._update_menubar_icon(delegate)
 
-        # No icon should be set when both are None
         button.setImage_.assert_not_called()
-        # Should show formatted stats as fallback text
-        self._assert_title_fragments(status_item, includes=["2 req", "1 wait", "50.5 tok/s"])
+        self._assert_displayed_title(status_item, button, "1k tok/s")
 
-    def test_update_menubar_icon_selects_best_prefill_among_concurrent_informative_prefills(
-        self, app_module
-    ):
-        """Two informative prefills should select the most progressed one, not last in iteration order.
-
-        This is a contract test that exposes the bug where iteration order determines
-        selection rather than a stable "best sample" rule. The bug is in _format_menubar_title():306
-        where the guard `best_prefill_processed == 0 or True` is always true, causing every
-        informative prefill to overwrite the previous one.
-
-        Scenario:
-        - Prefill A: 3000/4000 tok, 100 tok/s, 10s eta (MOST INFORMATIVE: most progressed)
-        - Prefill B: 1000/4000 tok, 50 tok/s, 60s eta (LESS INFORMATIVE)
-
-        Expected: Prefill A should be selected (most progressed / most informative)
-        Buggy behavior: Prefill B would be selected (last in iteration order)
-        """
-        stats = {
-            "avg_generation_tps": 78.4,
-            "active_models": {
-                "total_active_requests": 0,
-                "total_waiting_requests": 2,
-                "models": [
-                    {
-                        "id": "mlx-community/Qwen3-Coder-30B-A3B",
-                        "active_requests": 0,
-                        "waiting_requests": 2,
-                        "prefilling": [
+    def test_visible_live_badges_keep_a_shared_fixed_width_slot(self, app_module):
+        """Visible live metrics should reserve the same width across badge states."""
+        state_cases = [
+            (
+                {
+                    "avg_generation_tps": 0.0,
+                    "active_models": {
+                        "total_active_requests": 1,
+                        "total_waiting_requests": 0,
+                        "models": [
                             {
-                                "request_id": "req-most-progressed",
-                                "processed": 3000,
-                                "total": 4000,
-                                "speed": 100.0,
-                                "eta": 10.0,
-                            },
-                            {
-                                "request_id": "req-less-progressed",
-                                "processed": 1000,
-                                "total": 4000,
-                                "speed": 50.0,
-                                "eta": 60.0,
-                            },
-                        ],
-                    }
-                ],
-            },
-        }
-        delegate, status_item, button = self._make_delegate(
-            app_module, stats, app_module.ServerStatus.RUNNING
-        )
-
-        app_module.OMLXAppDelegate._update_menubar_icon(delegate)
-
-        self._assert_final_icon(button, "filled-icon")
-        # Should show the MOST INFORMATIVE prefill (3000/4000, 100 tok/s, 10s)
-        # NOT the last one in iteration order (1000/4000, 50 tok/s, 60s)
-        self._assert_title_fragments(
-            status_item,
-            includes=("2 PP", "3.0k/4.0k tok", "100 tok/s", "10s"),
-            excludes=("1.0k/4.0k tok", "50 tok/s", "60s", "req", "wait"),
-        )
-
-    def test_update_menubar_icon_selects_best_prefill_across_multiple_models(
-        self, app_module
-    ):
-        """Concurrent prefills across models should select the most progressed, not last model in iteration.
-
-        This tests the contract that when multiple models have informative prefills,
-        the one with the highest processed value wins regardless of model iteration order.
-
-        Scenario (reversed order to expose bug):
-        - Model B: 3000/4000 tok, 100 tok/s, 10s eta (MOST PRORESSED - FIRST in iteration)
-        - Model A: 2000/4000 tok, 80 tok/s, 25s eta (LESS PRORESSED - LAST in iteration)
-
-        Expected: Model B's prefill should be selected (3000 > 2000)
-        Buggy behavior: Model A's prefill (2000) would be selected due to `or True` bug
-        where every informative prefill overwrites the previous one regardless of processed value.
-        """
-        stats = {
-            "avg_generation_tps": 78.4,
-            "active_models": {
-                "total_active_requests": 0,
-                "total_waiting_requests": 2,
-                "models": [
-                    {
-                        "id": "model-B",
-                        "active_requests": 0,
-                        "waiting_requests": 1,
-                        "prefilling": [
-                            {
-                                "request_id": "req-b",
-                                "processed": 3000,  # MOST PRORESSED - FIRST
-                                "total": 4000,
-                                "speed": 100.0,
-                                "eta": 10.0,
-                            },
+                                "id": "prefill-model",
+                                "active_requests": 1,
+                                "waiting_requests": 0,
+                                "prefilling": [
+                                    {
+                                        "request_id": "req-pp",
+                                        "processed": 600,
+                                        "total": 1000,
+                                        "speed": 300.0,
+                                        "eta": 1.3,
+                                    }
+                                ],
+                            }
                         ],
                     },
-                    {
-                        "id": "model-A",
-                        "active_requests": 0,
-                        "waiting_requests": 1,
-                        "prefilling": [
+                },
+                "60%",
+            ),
+            (
+                {
+                    "avg_generation_tps": 1024.6,
+                    "active_models": {
+                        "total_active_requests": 2,
+                        "total_waiting_requests": 1,
+                        "models": [
                             {
-                                "request_id": "req-a",
-                                "processed": 2000,  # LESS PRORESSED - LAST (bug would pick this)
-                                "total": 4000,
-                                "speed": 80.0,
-                                "eta": 25.0,
-                            },
+                                "id": "gen-model",
+                                "active_requests": 2,
+                                "waiting_requests": 1,
+                                "prefilling": [],
+                            }
                         ],
                     },
-                ],
-            },
-        }
-        delegate, status_item, button = self._make_delegate(
-            app_module, stats, app_module.ServerStatus.RUNNING
-        )
-
-        app_module.OMLXAppDelegate._update_menubar_icon(delegate)
-
-        self._assert_final_icon(button, "filled-icon")
-        # Should show Model B's prefill (3000 > 2000), NOT Model A's (last in iteration)
-        self._assert_title_fragments(
-            status_item,
-            includes=("2 PP", "3.0k/4.0k tok", "100 tok/s", "10s"),
-            excludes=("2.0k/4.0k tok", "80 tok/s", "25s"),
-        )
-
-    def test_update_menubar_icon_tie_breaks_by_speed_when_processed_equal(
-        self, app_module
-    ):
-        """When processed values are equal, faster speed should win as tie-breaker.
-
-        This tests the tie-breaker contract: among prefills with equal processed values,
-        the one with higher speed (faster progress rate) should be selected.
-
-        Scenario (reversed order to expose bug):
-        - Model B: 2000/4000 tok, 100 tok/s, 20s eta (Faster - FIRST in iteration)
-        - Model A: 2000/4000 tok, 50 tok/s, 40s eta (Slower - LAST in iteration)
-
-        Expected: Model B's prefill should be selected (same processed, higher speed)
-        Buggy behavior: Model A's prefill (50 tok/s) would be selected due to iteration order
-        overwriting, since the `or True` bug causes every informative prefill to overwrite.
-        Note: If this test fails, it means tie-breaker logic is not implemented.
-        """
-        stats = {
-            "avg_generation_tps": 78.4,
-            "active_models": {
-                "total_active_requests": 0,
-                "total_waiting_requests": 2,
-                "models": [
-                    {
-                        "id": "model-B",
-                        "active_requests": 0,
-                        "waiting_requests": 1,
-                        "prefilling": [
+                },
+                "1k tok/s",
+            ),
+            (
+                {
+                    "avg_generation_tps": 0.0,
+                    "active_models": {
+                        "total_active_requests": 0,
+                        "total_waiting_requests": 4,
+                        "models": [
                             {
-                                "request_id": "req-faster",
-                                "processed": 2000,  # EQUAL processed - FIRST
-                                "total": 4000,
-                                "speed": 100.0,    # Faster
-                                "eta": 20.0,
-                            },
+                                "id": "queue-model",
+                                "active_requests": 0,
+                                "waiting_requests": 4,
+                                "prefilling": [],
+                            }
                         ],
                     },
-                    {
-                        "id": "model-A",
-                        "active_requests": 0,
-                        "waiting_requests": 1,
-                        "prefilling": [
-                            {
-                                "request_id": "req-slower",
-                                "processed": 2000,
-                                "total": 4000,
-                                "speed": 50.0,   # Slower - LAST (bug would pick this)
-                                "eta": 40.0,
-                            },
-                        ],
-                    },
-                ],
-            },
-        }
-        delegate, status_item, button = self._make_delegate(
-            app_module, stats, app_module.ServerStatus.RUNNING
-        )
+                },
+                "Q4",
+            ),
+        ]
 
-        app_module.OMLXAppDelegate._update_menubar_icon(delegate)
+        widths = []
+        minimum_width = self._minimum_live_metric_width("1k tok/s")
+        for stats, expected_title in state_cases:
+            delegate, status_item, button = self._make_delegate(
+                app_module,
+                stats,
+                app_module.ServerStatus.RUNNING,
+                show_live_metrics=True,
+            )
 
-        self._assert_final_icon(button, "filled-icon")
-        # Should show faster speed (100 tok/s) as tie-breaker, NOT slower (last in iteration)
-        self._assert_title_fragments(
-            status_item,
-            includes=("2 PP", "2.0k/4.0k tok", "100 tok/s", "20s"),
-            excludes=("50 tok/s", "40s"),
-        )
+            app_module.OMLXAppDelegate._update_menubar_icon(delegate)
 
-    def test_update_menubar_icon_fallbacks_to_first_prefill_when_no_speed_eta(
-        self, app_module
-    ):
-        """When no prefill has speed/eta, first prefill should be displayed (fallback path).
+            self._assert_final_icon(button, "filled-icon")
+            self._assert_displayed_title(status_item, button, expected_title)
+            widths.append(
+                self._assert_fixed_width(
+                    status_item,
+                    app_module,
+                    minimum_width=minimum_width,
+                )
+            )
 
-        This tests the fallback contract: when prefills exist but none have both
-        speed > 0 and eta is not None, the first prefill in iteration order should be used.
+        assert len(set(widths)) == 1
 
-        Scenario:
-        - Model A has two prefills, both without speed/eta:
-          - First: 512/4096 tok, speed=0, eta=None
-          - Second: 1024/4096 tok, speed=0, eta=None
-
-        Expected: First prefill (512/4096) should be shown
-        Buggy behavior: The `or True` condition at line 306 makes this fallback unreachable
-
-        This test also serves as regression test for the `or True` bug.
-        """
-        stats = {
-            "avg_generation_tps": 78.4,
-            "active_models": {
-                "total_active_requests": 0,
-                "total_waiting_requests": 3,
-                "models": [
-                    {
-                        "id": "model-A",
-                        "active_requests": 0,
-                        "waiting_requests": 2,
-                        "prefilling": [
-                            {
-                                "request_id": "req-first",
-                                "processed": 512,
-                                "total": 4096,
-                                "speed": 0.0,     # NO speed
-                                "eta": None,       # NO eta
-                            },
-                            {
-                                "request_id": "req-second",
-                                "processed": 1024,
-                                "total": 4096,
-                                "speed": 0.0,     # NO speed
-                                "eta": None,       # NO eta
-                            },
-                        ],
-                    },
-                ],
-            },
-        }
-        delegate, status_item, button = self._make_delegate(
-            app_module, stats, app_module.ServerStatus.RUNNING
-        )
-
-        app_module.OMLXAppDelegate._update_menubar_icon(delegate)
-
-        self._assert_final_icon(button, "filled-icon")
-        # Should show first prefill (512/4096), not second (1024/4096)
-        # Since no speed/eta, those should not appear in the title
-        self._assert_title_fragments(
-            status_item,
-            includes=("2 PP", "512/4.1k tok"),  # First prefill
-            excludes=("1.0k/4.1k tok", "tok/s", "None", "left"),  # No speed/eta shown
-        )
