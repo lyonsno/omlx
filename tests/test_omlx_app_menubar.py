@@ -33,6 +33,7 @@ def app_module():
         "AppKit",
         "Foundation",
         "objc",
+        "requests",
         "omlx",
         "omlx._version",
         "omlx_app",
@@ -114,6 +115,11 @@ def app_module():
     objc_mod.IBAction = lambda fn: fn
     objc_mod.selector = lambda fn, signature=None: fn
 
+    fake_requests = types.ModuleType("requests")
+    fake_requests.Session = MagicMock()
+    fake_requests.RequestException = RuntimeError
+    fake_requests.ConnectionError = RuntimeError
+
     fake_omlx = types.ModuleType("omlx")
     fake_omlx.__path__ = []
     fake_version = types.ModuleType("omlx._version")
@@ -161,6 +167,7 @@ def app_module():
         sys.modules["AppKit"] = appkit
         sys.modules["Foundation"] = foundation
         sys.modules["objc"] = objc_mod
+        sys.modules["requests"] = fake_requests
         sys.modules["omlx"] = fake_omlx
         sys.modules["omlx._version"] = fake_version
         sys.modules["omlx_app"] = fake_package
@@ -1041,7 +1048,6 @@ class TestRefreshIntervalControls:
             == preferences_module.NSColor.secondaryLabelColor()
         )
 
-
 class TestRefreshIntervalLifecycle:
     """Tests for launch/save wiring of the refresh interval."""
 
@@ -1144,6 +1150,180 @@ class TestRefreshIntervalLifecycle:
         assert delegate._last_refresh_interval == 2
         delegate._update_status_display.assert_called_once_with()
 
+    def test_prefs_save_clears_cached_admin_state_before_refreshing_ui_on_port_change(
+        self, app_module
+    ):
+        """Connection-setting changes should drop stale admin state before repainting."""
+        server_manager = Mock(config=types.SimpleNamespace(port=8000))
+        stale_session = object()
+        refresh_snapshot = {}
+        delegate = types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                stats_refresh_interval=5,
+                port=9000,
+                base_path="/tmp/.omlx",
+                get_server_api_key=Mock(return_value="new-key"),
+            ),
+            server_manager=server_manager,
+            _last_refresh_interval=5,
+            _restart_health_timer=Mock(),
+            _cached_stats={"avg_generation_tps": 123.0},
+            _cached_alltime_stats={"generated_tokens": 999},
+            _admin_session=stale_session,
+            _last_admin_source=("/tmp/.omlx", 8000, "old-key"),
+        )
+        delegate._update_status_display = Mock(
+            side_effect=lambda: refresh_snapshot.update(
+                {
+                    "cached_stats": delegate._cached_stats,
+                    "cached_alltime_stats": delegate._cached_alltime_stats,
+                    "admin_session": delegate._admin_session,
+                }
+            )
+        )
+
+        app_module.OMLXAppDelegate._on_prefs_saved(delegate)
+
+        server_manager.update_config.assert_called_once_with(delegate.config)
+        assert refresh_snapshot["cached_stats"] is None
+        assert refresh_snapshot["cached_alltime_stats"] is None
+        assert refresh_snapshot["admin_session"] is None
+        assert delegate._cached_stats is None
+        assert delegate._cached_alltime_stats is None
+        assert delegate._admin_session is None
+        delegate._update_status_display.assert_called_once_with()
+
+    def test_connection_change_fetches_stats_immediately_when_running(
+        self, app_module
+    ):
+        """A running server should attempt an immediate stats refresh after an admin-source change."""
+        server_manager = Mock(
+            status=app_module.ServerStatus.RUNNING,
+            config=types.SimpleNamespace(port=8000),
+        )
+        events = []
+        delegate = types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                stats_refresh_interval=60,
+                port=9000,
+                base_path="/tmp/.omlx",
+                get_server_api_key=Mock(return_value="new-key"),
+            ),
+            server_manager=server_manager,
+            _last_refresh_interval=60,
+            _last_stats_fetch=100.0,
+            _restart_health_timer=Mock(),
+            _update_status_display=Mock(side_effect=lambda: events.append("display")),
+            _update_menubar_icon=Mock(),
+            _build_menu=Mock(),
+            _fetch_stats=Mock(side_effect=lambda: events.append("fetch")),
+            _cached_stats={"avg_generation_tps": 123.0},
+            _cached_alltime_stats={"generated_tokens": 999},
+            _admin_session=object(),
+            _last_admin_source=("/tmp/.omlx", 8000, "old-key"),
+        )
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(app_module.time, "time", lambda: 101.0)
+            app_module.OMLXAppDelegate._on_prefs_saved(delegate)
+
+        delegate._fetch_stats.assert_called_once_with()
+        assert delegate._last_stats_fetch == 101.0
+        assert events == ["fetch", "display"]
+
+    def test_prefs_save_clears_cached_admin_state_before_refreshing_ui_on_api_key_change(
+        self, app_module
+    ):
+        """API-key rotation should also invalidate stale admin state before repainting."""
+        server_manager = Mock(config=types.SimpleNamespace(port=9000))
+        stale_session = object()
+        refresh_snapshot = {}
+        delegate = types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                stats_refresh_interval=5,
+                port=9000,
+                base_path="/tmp/.omlx",
+                get_server_api_key=Mock(return_value="new-key"),
+            ),
+            server_manager=server_manager,
+            _last_refresh_interval=5,
+            _restart_health_timer=Mock(),
+            _cached_stats={"avg_generation_tps": 123.0},
+            _cached_alltime_stats={"generated_tokens": 999},
+            _admin_session=stale_session,
+            _last_admin_source=("/tmp/.omlx", 9000, "old-key"),
+        )
+        delegate._update_status_display = Mock(
+            side_effect=lambda: refresh_snapshot.update(
+                {
+                    "cached_stats": delegate._cached_stats,
+                    "cached_alltime_stats": delegate._cached_alltime_stats,
+                    "admin_session": delegate._admin_session,
+                }
+            )
+        )
+
+        app_module.OMLXAppDelegate._on_prefs_saved(delegate)
+
+        server_manager.update_config.assert_called_once_with(delegate.config)
+        assert refresh_snapshot["cached_stats"] is None
+        assert refresh_snapshot["cached_alltime_stats"] is None
+        assert refresh_snapshot["admin_session"] is None
+        assert delegate._cached_stats is None
+        assert delegate._cached_alltime_stats is None
+        assert delegate._admin_session is None
+        delegate._update_status_display.assert_called_once_with()
+
+    def test_prefs_save_preserves_cached_admin_state_for_non_connection_changes(
+        self, app_module
+    ):
+        """Unrelated prefs saves should not discard a still-valid admin session."""
+        server_manager = Mock(config=types.SimpleNamespace(port=9000))
+        cached_stats = {"avg_generation_tps": 123.0}
+        cached_alltime_stats = {"generated_tokens": 999}
+        live_session = object()
+        refresh_snapshot = {}
+        delegate = types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                stats_refresh_interval=2,
+                port=9000,
+                base_path="/tmp/.omlx",
+                get_server_api_key=Mock(return_value="same-key"),
+                show_live_metrics_in_menu_bar=True,
+                start_server_on_launch=True,
+            ),
+            server_manager=server_manager,
+            _last_refresh_interval=5,
+            _restart_health_timer=Mock(),
+            _update_status_display=Mock(),
+            _cached_stats=cached_stats,
+            _cached_alltime_stats=cached_alltime_stats,
+            _admin_session=live_session,
+            _last_admin_source=("/tmp/.omlx", 9000, "same-key"),
+        )
+        delegate._update_status_display = Mock(
+            side_effect=lambda: refresh_snapshot.update(
+                {
+                    "cached_stats": delegate._cached_stats,
+                    "cached_alltime_stats": delegate._cached_alltime_stats,
+                    "admin_session": delegate._admin_session,
+                }
+            )
+        )
+
+        app_module.OMLXAppDelegate._on_prefs_saved(delegate)
+
+        server_manager.update_config.assert_called_once_with(delegate.config)
+        assert refresh_snapshot["cached_stats"] is cached_stats
+        assert refresh_snapshot["cached_alltime_stats"] is cached_alltime_stats
+        assert refresh_snapshot["admin_session"] is live_session
+        assert delegate._cached_stats is cached_stats
+        assert delegate._cached_alltime_stats is cached_alltime_stats
+        assert delegate._admin_session is live_session
+        delegate._restart_health_timer.assert_called_once_with(2)
+        assert delegate._last_refresh_interval == 2
+        delegate._update_status_display.assert_called_once_with()
+
     def test_prefs_save_skips_timer_restart_when_interval_is_unchanged(
         self, app_module
     ):
@@ -1163,3 +1343,73 @@ class TestRefreshIntervalLifecycle:
         delegate._restart_health_timer.assert_not_called()
         assert delegate._last_refresh_interval == 5
         delegate._update_status_display.assert_called_once_with()
+
+    def test_restart_health_timer_invalidates_old_timer_and_replaces_it(
+        self, app_module
+    ):
+        """Restarting the health timer should invalidate the old timer before swapping in the new one."""
+        events = []
+        old_timer = Mock()
+        new_timer = Mock()
+        old_timer.invalidate.side_effect = lambda: events.append("invalidate-old")
+        app_module.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_.side_effect = (
+            lambda *args: events.append("schedule-new") or new_timer
+        )
+        app_module.NSRunLoop.currentRunLoop().addTimer_forMode_.side_effect = (
+            lambda timer, mode: events.append(("register-new", timer, mode))
+        )
+        delegate = types.SimpleNamespace(health_timer=old_timer)
+
+        app_module.OMLXAppDelegate._restart_health_timer(delegate, 2)
+
+        old_timer.invalidate.assert_called_once_with()
+        assert delegate.health_timer is new_timer
+        app_module.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_.assert_called_once_with(
+            2, delegate, "healthCheck:", None, True
+        )
+        app_module.NSRunLoop.currentRunLoop().addTimer_forMode_.assert_called_once_with(
+            new_timer, app_module.NSDefaultRunLoopMode
+        )
+        assert events == [
+            "invalidate-old",
+            "schedule-new",
+            ("register-new", new_timer, app_module.NSDefaultRunLoopMode),
+        ]
+
+    def test_restart_health_timer_invalidates_intermediate_timer_on_rapid_changes(
+        self, app_module
+    ):
+        """Rapid interval changes should only leave the most recent timer active."""
+        events = []
+        first_timer = Mock()
+        second_timer = Mock()
+        third_timer = Mock()
+        first_timer.invalidate.side_effect = lambda: events.append("invalidate-first")
+        second_timer.invalidate.side_effect = lambda: events.append("invalidate-second")
+
+        def schedule(interval, *args):
+            events.append(f"schedule-{int(interval)}")
+            return second_timer if int(interval) == 10 else third_timer
+
+        app_module.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_.side_effect = schedule
+        app_module.NSRunLoop.currentRunLoop().addTimer_forMode_.side_effect = (
+            lambda timer, mode: events.append(
+                "register-second" if timer is second_timer else "register-third"
+            )
+        )
+        delegate = types.SimpleNamespace(health_timer=first_timer)
+
+        app_module.OMLXAppDelegate._restart_health_timer(delegate, 10)
+        app_module.OMLXAppDelegate._restart_health_timer(delegate, 2)
+
+        first_timer.invalidate.assert_called_once_with()
+        second_timer.invalidate.assert_called_once_with()
+        assert delegate.health_timer is third_timer
+        assert events == [
+            "invalidate-first",
+            "schedule-10",
+            "register-second",
+            "invalidate-second",
+            "schedule-2",
+            "register-third",
+        ]

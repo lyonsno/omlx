@@ -139,6 +139,16 @@ class TestServerConfig:
 
         assert config.stats_refresh_interval == 5
 
+    @pytest.mark.parametrize(
+        "bad_port",
+        ["abc", None, 8000.5, True, False, -1, 0, 1, 1023, 65536, 70000],
+    )
+    def test_from_dict_invalid_port_uses_default(self, bad_port):
+        """Malformed persisted port values should not survive into the runtime config."""
+        config = ServerConfig.from_dict({"port": bad_port})
+
+        assert config.port == 8000
+
     def test_save_and_load(self, tmp_path: Path):
         """Test save and load round-trip."""
         config_file = tmp_path / "config.json"
@@ -255,6 +265,20 @@ class TestServerConfig:
         config = ServerConfig(base_path=str(tmp_path))
         assert config.get_server_api_key() is None
 
+    @pytest.mark.parametrize(
+        "settings_payload",
+        [[1, 2, 3], {"auth": []}, {"auth": "not-a-dict"}],
+    )
+    def test_get_server_api_key_malformed_structure_returns_none(
+        self, tmp_path: Path, settings_payload
+    ):
+        """Malformed but JSON-valid settings should degrade to no key, not crash."""
+        config = ServerConfig(base_path=str(tmp_path))
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(json.dumps(settings_payload))
+
+        assert config.get_server_api_key() is None
+
     def test_load_server_settings(self, tmp_path: Path):
         """Test loading settings from server's settings.json."""
         config = ServerConfig(base_path=str(tmp_path))
@@ -291,6 +315,40 @@ class TestServerConfig:
         config = ServerConfig(base_path=str(tmp_path), port=8000, model_dir="")
         config.sync_from_server_settings()
         assert config.port == 8000
+        assert config.model_dir == ""
+
+    @pytest.mark.parametrize("bad_port", [70000, 1023, "abc"])
+    def test_sync_from_server_settings_invalid_port_preserves_current_port(
+        self, tmp_path: Path, bad_port
+    ):
+        """Invalid server-settings ports should not overwrite the live app config."""
+        config = ServerConfig(base_path=str(tmp_path), port=9000, model_dir="")
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "model": {"model_dir": "/synced/models"},
+                    "server": {"port": bad_port},
+                }
+            )
+        )
+
+        config.sync_from_server_settings()
+
+        assert config.port == 9000
+        assert config.model_dir == "/synced/models"
+
+    def test_sync_from_server_settings_malformed_structure_does_not_change_config(
+        self, tmp_path: Path
+    ):
+        """Malformed server settings should not crash Preferences/Welcome sync."""
+        config = ServerConfig(base_path=str(tmp_path), port=9000, model_dir="")
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(json.dumps([1, 2, 3]))
+
+        config.sync_from_server_settings()
+
+        assert config.port == 9000
         assert config.model_dir == ""
 
     def test_set_server_api_key_new_file(self, tmp_path: Path):

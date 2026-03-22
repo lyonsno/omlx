@@ -185,6 +185,7 @@ class OMLXAppDelegate(NSObject):
         self._updater = None  # AppUpdater instance during download
         self._update_progress_text = ""  # Current download progress text
         self._using_attributed_menubar_title = False
+        self._last_admin_source = OMLXAppDelegate._get_admin_connection_source(self)
 
         return self
 
@@ -206,6 +207,20 @@ class OMLXAppDelegate(NSObject):
         alert.addButtonWithTitle_("Quit")
         alert.runModal()
         NSApp.terminate_(None)
+
+    def _get_admin_connection_source(self) -> tuple[str, int, str | None]:
+        """Return the tuple that determines which admin stats source we talk to."""
+        base_path = str(Path(getattr(self.config, "base_path", "")).expanduser())
+        raw_port = getattr(self.config, "port", 0)
+        try:
+            port = int(raw_port or 0)
+        except (TypeError, ValueError):
+            port = 0
+        if port < 1 or port > 65535:
+            port = 0
+        get_api_key = getattr(self.config, "get_server_api_key", None)
+        api_key = get_api_key() if callable(get_api_key) else None
+        return base_path, port, api_key
 
     def _doFinishLaunching(self):
         """Actual launch logic (separated for proper exception handling)."""
@@ -1178,18 +1193,43 @@ class OMLXAppDelegate(NSObject):
 
     def _on_prefs_saved(self):
         """Callback after preferences are saved."""
+        previous_admin_source = getattr(self, "_last_admin_source", None)
         self.server_manager.update_config(self.config)
-        
+
+        new_admin_source = OMLXAppDelegate._get_admin_connection_source(self)
+        self._last_admin_source = new_admin_source
+        admin_source_changed = (
+            previous_admin_source is not None
+            and previous_admin_source != new_admin_source
+        )
+
+        if admin_source_changed:
+            # Connection-related preference changes can make the current admin
+            # session and cached stats invalid immediately, so clear them before
+            # repainting any live menubar state.
+            self._cached_stats = None
+            self._cached_alltime_stats = None
+            self._admin_session = None
+            if self.server_manager.status == ServerStatus.RUNNING:
+                # Fetch immediately so the menubar does not sit in a blank or
+                # stale state until the next scheduled timer fire.
+                self._fetch_stats()
+                self._last_stats_fetch = time.time()
+            else:
+                # Force the next timer tick to refetch stats immediately for the
+                # new admin source instead of waiting out the old poll interval.
+                self._last_stats_fetch = 0.0
+
         # Restart timer if refresh interval changed
         old_interval = self._last_refresh_interval
         new_interval = self.config.stats_refresh_interval
-        
+
         if old_interval != new_interval:
             self._restart_health_timer(new_interval)
             self._last_refresh_interval = new_interval
-        
+
         self._update_status_display()
-    
+
     def _restart_health_timer(self, new_interval: float):
         """Invalidate old timer and create new one with updated interval.
         

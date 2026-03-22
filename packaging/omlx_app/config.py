@@ -11,6 +11,15 @@ import requests
 logger = logging.getLogger(__name__)
 
 
+def _coerce_valid_port(value: object) -> Optional[int]:
+    """Return a valid TCP port for app/server settings, or None if invalid."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 1024 or value > 65535:
+        return None
+    return value
+
+
 def get_app_support_dir() -> Path:
     """Get the Application Support directory for oMLX."""
     app_support = Path.home() / "Library" / "Application Support" / "oMLX"
@@ -45,6 +54,7 @@ class ServerConfig:
     start_server_on_launch: bool = False
     show_live_metrics_in_menu_bar: bool = False
     stats_refresh_interval: int = 5  # seconds, 1-60 range
+
     def get_effective_model_dir(self) -> str:
         """Get the model directory, using base_path/models if not specified."""
         if self.model_dir:
@@ -61,8 +71,18 @@ class ServerConfig:
 
     @classmethod
     def from_dict(cls, data: dict) -> "ServerConfig":
+        if not isinstance(data, dict):
+            return cls()
+
         valid_keys = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in data.items() if k in valid_keys}
+
+        if "port" in filtered:
+            port = _coerce_valid_port(filtered["port"])
+            if port is None:
+                filtered["port"] = 8000
+            else:
+                filtered["port"] = port
 
         # Validate and clamp stats_refresh_interval to 1-60 range
         if "stats_refresh_interval" in filtered:
@@ -78,6 +98,7 @@ class ServerConfig:
                 filtered["stats_refresh_interval"] = max(1, min(60, interval))
 
         return cls(**filtered)
+
     def save(self) -> None:
         with open(get_config_path(), "w") as f:
             json.dump(self.to_dict(), f, indent=2)
@@ -100,7 +121,13 @@ class ServerConfig:
             try:
                 with open(settings_file) as f:
                     data = json.load(f)
-                return data.get("auth", {}).get("api_key")
+                if not isinstance(data, dict):
+                    return None
+                auth = data.get("auth", {})
+                if not isinstance(auth, dict):
+                    return None
+                api_key = auth.get("api_key")
+                return api_key if isinstance(api_key, str) and api_key else None
             except (json.JSONDecodeError, OSError):
                 pass
         return None
@@ -115,7 +142,9 @@ class ServerConfig:
                     data = json.load(f)
             except (json.JSONDecodeError, OSError):
                 pass
-        if "auth" not in data:
+        if not isinstance(data, dict):
+            data = {}
+        if not isinstance(data.get("auth"), dict):
             data["auth"] = {}
         data["auth"]["api_key"] = api_key
         settings_file.parent.mkdir(parents=True, exist_ok=True)
@@ -182,10 +211,27 @@ class ServerConfig:
         try:
             with open(settings_file) as f:
                 data = json.load(f)
-            return {
-                "model_dir": data.get("model", {}).get("model_dir"),
-                "port": data.get("server", {}).get("port", 8000),
-            }
+            if not isinstance(data, dict):
+                return {}
+
+            model = data.get("model", {})
+            if not isinstance(model, dict):
+                model = {}
+
+            server = data.get("server", {})
+            if not isinstance(server, dict):
+                server = {}
+
+            result = {}
+            model_dir = model.get("model_dir")
+            if isinstance(model_dir, str) and model_dir:
+                result["model_dir"] = model_dir
+
+            port = _coerce_valid_port(server.get("port"))
+            if port is not None:
+                result["port"] = port
+
+            return result
         except (json.JSONDecodeError, OSError) as e:
             return {}
 
@@ -218,7 +264,9 @@ class ServerConfig:
                     data = json.load(f)
             except (json.JSONDecodeError, OSError):
                 pass
-        if "model" not in data:
+        if not isinstance(data, dict):
+            data = {}
+        if not isinstance(data.get("model"), dict):
             data["model"] = {}
         existing_dirs = data["model"].get("model_dirs", [])
         if not existing_dirs:
