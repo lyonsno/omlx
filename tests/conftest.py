@@ -6,12 +6,13 @@ This module provides common fixtures used across test files.
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from unittest.mock import MagicMock
 
 import pytest
 
-from omlx.request import Request, SamplingParams
+if TYPE_CHECKING:
+    from omlx.request import Request
 
 
 class MockTokenizer:
@@ -125,8 +126,10 @@ def tmp_cache_dir(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def sample_request() -> Request:
+def sample_request() -> "Request":
     """Factory fixture for creating sample Request objects."""
+    from omlx.request import Request, SamplingParams
+
     return Request(
         request_id="test-request-001",
         prompt="Hello, world!",
@@ -141,6 +144,7 @@ def sample_request() -> Request:
 @pytest.fixture
 def sample_request_factory():
     """Factory fixture for creating multiple Request objects."""
+    from omlx.request import Request, SamplingParams
 
     def _create_request(
         request_id: str = "test-request-001",
