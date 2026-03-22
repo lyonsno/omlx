@@ -145,6 +145,7 @@ def _make_delegate(
     if status is None:
         status = app_module.ServerStatus.RUNNING
     delegate = types.SimpleNamespace(
+        config=types.SimpleNamespace(get_server_api_key=lambda: "test-key", port=11434),
         server_manager=types.SimpleNamespace(status=status, stop=Mock()),
         _last_health_status=last_health_status,
         _last_stats_fetch=last_stats_fetch,
@@ -159,6 +160,7 @@ def _make_delegate(
         _cached_stats=None,
         _cached_alltime_stats=None,
         _admin_session=None,
+        performSelectorOnMainThread_withObject_waitUntilDone_=Mock(),
     )
     delegate._invalidate_stats_refresh_generation = (
         app_module.OMLXAppDelegate._invalidate_stats_refresh_generation.__get__(
@@ -166,6 +168,13 @@ def _make_delegate(
         )
     )
     return delegate
+
+
+def _make_response(status_code, payload=None):
+    """Create a tiny fake HTTP response object for stats polling tests."""
+    if payload is None:
+        payload = {}
+    return types.SimpleNamespace(status_code=status_code, json=lambda: payload)
 
 
 class TestAsyncStatsRefreshContract:
@@ -182,7 +191,9 @@ class TestAsyncStatsRefreshContract:
             menu=None,
             health_timer=None,
             welcome_controller=None,
-            config=types.SimpleNamespace(is_first_run=False, start_server_on_launch=False),
+            config=types.SimpleNamespace(
+                is_first_run=False, start_server_on_launch=False
+            ),
             server_manager=server_manager,
             _load_menubar_icon=Mock(return_value=None),
             _update_menubar_icon=Mock(),
@@ -302,17 +313,63 @@ class TestAsyncStatsRefreshContract:
         delegate._build_menu.assert_called_once_with()
         delegate._update_menubar_icon.assert_called_once_with()
 
-    def test_stats_refresh_failure_clears_in_flight_without_timestamp_bump(
+    def test_unexpected_worker_failure_clears_in_flight_without_timestamp_bump(
         self, app_module
     ):
-        """Failure path should also release single-flight so future ticks can retry."""
+        """Unexpected worker exceptions should release single-flight without consuming cooldown."""
         delegate = _make_delegate(app_module, last_stats_fetch=17.0, in_flight=True)
 
-        app_module.OMLXAppDelegate.statsRefreshFailedOnMain_(delegate, "network down")
+        app_module.OMLXAppDelegate.statsRefreshFailedOnMain_(delegate, "worker crashed")
 
         assert delegate._stats_refresh_in_flight is False
         assert delegate._last_stats_fetch == 17.0
         delegate._update_menubar_icon.assert_called_once_with()
+
+    def test_request_exception_uses_finished_path_and_consumes_cooldown(
+        self, app_module
+    ):
+        """Request failures still consume the polling interval, matching upstream behavior."""
+        delegate = _make_delegate(app_module, last_stats_fetch=17.0, in_flight=True)
+        delegate._fetch_stats_snapshot = (
+            app_module.OMLXAppDelegate._fetch_stats_snapshot.__get__(delegate)
+        )
+
+        failing_session = Mock()
+        failing_session.get.side_effect = app_module.requests.RequestException(
+            "network down"
+        )
+
+        class InlineThread:
+            def __init__(self, *, target, name, daemon):
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                app_module.requests, "Session", Mock(return_value=failing_session)
+            )
+            mp.setattr(app_module.threading, "Thread", InlineThread)
+            mp.setattr(app_module.time, "time", lambda: 42.0)
+            app_module.OMLXAppDelegate._start_stats_refresh(delegate)
+
+        selector, payload, wait = (
+            delegate.performSelectorOnMainThread_withObject_waitUntilDone_.call_args[0]
+        )
+        assert selector == "statsRefreshFinishedOnMain:"
+        assert payload["stats"] is None
+        assert payload["alltime_stats"] is None
+        assert payload["session"] is None
+        assert wait is False
+
+        app_module.OMLXAppDelegate.statsRefreshFinishedOnMain_(delegate, payload)
+
+        assert delegate._stats_refresh_in_flight is False
+        assert delegate._last_stats_fetch == 42.0
+        assert delegate._cached_stats is None
+        assert delegate._cached_alltime_stats is None
+        assert delegate._admin_session is None
 
     def test_stale_success_completion_does_not_clear_current_in_flight(
         self, app_module
@@ -362,11 +419,77 @@ class TestAsyncStatsRefreshContract:
         assert delegate._last_stats_fetch == 30.0
         delegate._update_menubar_icon.assert_not_called()
 
+    def test_invalidated_generations_do_not_share_worker_sessions(self, app_module):
+        """Old and new generation workers should not reuse the same Session object."""
+        delegate = _make_delegate(app_module, in_flight=True, refresh_token=0)
+        delegate._fetch_stats_snapshot = (
+            app_module.OMLXAppDelegate._fetch_stats_snapshot.__get__(delegate)
+        )
+
+        session_one = Mock()
+        session_one.get.side_effect = [
+            _make_response(200, {"session": "one"}),
+            _make_response(200, {"alltime": "one"}),
+        ]
+        session_two = Mock()
+        session_two.get.side_effect = [
+            _make_response(200, {"session": "two"}),
+            _make_response(200, {"alltime": "two"}),
+        ]
+        scheduled_targets = []
+
+        class DeferredThread:
+            def __init__(self, *, target, name, daemon):
+                self._target = target
+
+            def start(self):
+                scheduled_targets.append(self._target)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                app_module.requests,
+                "Session",
+                Mock(side_effect=[session_one, session_two]),
+            )
+            mp.setattr(app_module.threading, "Thread", DeferredThread)
+            mp.setattr(app_module.time, "time", lambda: 42.0)
+            app_module.OMLXAppDelegate._start_stats_refresh(delegate)
+            app_module.OMLXAppDelegate._invalidate_stats_refresh_generation(delegate)
+            app_module.OMLXAppDelegate._start_stats_refresh(delegate)
+            scheduled_targets[0]()
+            scheduled_targets[1]()
+
+        assert delegate._admin_session is None
+        assert len(scheduled_targets) == 2
+
+        payloads = [
+            call.args[1]
+            for call in (
+                delegate.performSelectorOnMainThread_withObject_waitUntilDone_.call_args_list
+            )
+        ]
+        assert payloads[0]["token"] == 0
+        assert payloads[1]["token"] == 1
+        assert payloads[0]["session"] is session_one
+        assert payloads[1]["session"] is session_two
+        assert payloads[0]["session"] is not payloads[1]["session"]
+        assert delegate._admin_session is None
+
+        app_module.OMLXAppDelegate.statsRefreshFinishedOnMain_(delegate, payloads[0])
+        assert delegate._admin_session is None
+
+        app_module.OMLXAppDelegate.statsRefreshFinishedOnMain_(delegate, payloads[1])
+        assert delegate._admin_session is session_two
+
     def test_stale_completion_after_stop_is_discarded(self, app_module):
         """Results from pre-stop refreshes should not repopulate caches or bump cooldown."""
         server_manager = types.SimpleNamespace(
             status=app_module.ServerStatus.RUNNING,
-            stop=Mock(side_effect=lambda: setattr(server_manager, "status", app_module.ServerStatus.STOPPED)),
+            stop=Mock(
+                side_effect=lambda: setattr(
+                    server_manager, "status", app_module.ServerStatus.STOPPED
+                )
+            ),
         )
         delegate = types.SimpleNamespace(
             server_manager=server_manager,

@@ -10,12 +10,9 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
-from typing import Optional
 
 import objc
 import requests
-
-from omlx._version import __version__
 from AppKit import (
     NSApp,
     NSAppearanceNameDarkAqua,
@@ -32,8 +29,9 @@ from AppKit import (
     NSStatusBar,
     NSVariableStatusItemLength,
 )
-from Foundation import NSData, NSObject, NSRunLoop, NSDefaultRunLoopMode, NSTimer
+from Foundation import NSData, NSDefaultRunLoopMode, NSObject, NSRunLoop, NSTimer
 
+from . import __version__
 from .config import ServerConfig
 from .server_manager import PortConflict, ServerManager, ServerStatus
 
@@ -81,17 +79,17 @@ class OMLXAppDelegate(NSObject):
         self.health_timer = None
         self.welcome_controller = None
         self.preferences_controller = None
-        self._cached_stats: Optional[dict] = None
-        self._cached_alltime_stats: Optional[dict] = None
+        self._cached_stats: dict | None = None
+        self._cached_alltime_stats: dict | None = None
         self._last_stats_fetch: float = 0
         self._last_stats_refresh_started_at: float = 0
         self._stats_refresh_in_flight: bool = False
         self._stats_refresh_token: int = 0
-        self._last_health_status: Optional[ServerStatus] = None
-        self._admin_session: Optional[requests.Session] = None
-        self._icon_outline: Optional[NSImage] = None
-        self._icon_filled: Optional[NSImage] = None
-        self._update_info: Optional[dict] = None
+        self._last_health_status: ServerStatus | None = None
+        self._admin_session: requests.Session | None = None
+        self._icon_outline: NSImage | None = None
+        self._icon_filled: NSImage | None = None
+        self._update_info: dict | None = None
         self._last_update_check: float = 0
         self._updater = None  # AppUpdater instance during download
         self._update_progress_text = ""  # Current download progress text
@@ -204,7 +202,7 @@ class OMLXAppDelegate(NSObject):
             return dev_path
         return Path(__file__).parent
 
-    def _load_menubar_icon(self, svg_name: str) -> Optional[NSImage]:
+    def _load_menubar_icon(self, svg_name: str) -> NSImage | None:
         """Load an SVG file as a template image for the menubar.
 
         Template images automatically adapt to menubar background:
@@ -471,7 +469,7 @@ class OMLXAppDelegate(NSObject):
 
     # --- Menu building ---
 
-    def _create_menu_icon(self, sf_symbol: str) -> Optional[NSImage]:
+    def _create_menu_icon(self, sf_symbol: str) -> NSImage | None:
         """Create a menu item icon from SF Symbol (macOS 11+).
 
         Returns a template image that automatically adapts to menu theme.
@@ -770,7 +768,9 @@ class OMLXAppDelegate(NSObject):
 
     # --- Stats fetching ---
 
-    def _fetch_stats_snapshot(self) -> tuple[Optional[dict], Optional[dict], Optional[requests.Session]]:
+    def _fetch_stats_snapshot(
+        self, session: requests.Session | None = None
+    ) -> tuple[dict | None, dict | None, requests.Session | None]:
         """Fetch serving stats from the admin API and return a snapshot.
 
         Reuses a persistent session to avoid re-login on every poll cycle.
@@ -784,10 +784,8 @@ class OMLXAppDelegate(NSObject):
             if not api_key:
                 return None, None, None
 
-            if self._admin_session is None:
-                self._admin_session = requests.Session()
-
-            session = self._admin_session
+            if session is None:
+                session = requests.Session()
 
             # Try fetching stats directly (session cookie may still be valid)
             stats_resp = session.get(
@@ -832,7 +830,7 @@ class OMLXAppDelegate(NSObject):
 
     def _fetch_stats(self):
         """Fetch serving stats from the admin API and apply to cached state."""
-        stats, alltime_stats, session = self._fetch_stats_snapshot()
+        stats, alltime_stats, session = self._fetch_stats_snapshot(self._admin_session)
         self._cached_stats = stats
         self._cached_alltime_stats = alltime_stats
         self._admin_session = session
@@ -842,10 +840,13 @@ class OMLXAppDelegate(NSObject):
     def _start_stats_refresh(self):
         """Queue a non-blocking stats refresh worker."""
         refresh_token = self._stats_refresh_token
+        refresh_session = self._admin_session
 
         def _worker():
             try:
-                stats, alltime_stats, session = self._fetch_stats_snapshot()
+                stats, alltime_stats, session = self._fetch_stats_snapshot(
+                    refresh_session
+                )
                 finished_at = time.time()
                 self.performSelectorOnMainThread_withObject_waitUntilDone_(
                     "statsRefreshFinishedOnMain:",
