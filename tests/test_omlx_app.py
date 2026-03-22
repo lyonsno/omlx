@@ -38,6 +38,7 @@ class TestServerConfig:
         assert config.launch_at_login is False
         assert config.start_server_on_launch is False
         assert config.show_live_metrics_in_menu_bar is False
+        assert config.stats_refresh_interval == 5
 
     def test_custom_values(self):
         """Test ServerConfig with custom values."""
@@ -48,6 +49,7 @@ class TestServerConfig:
             launch_at_login=True,
             start_server_on_launch=True,
             show_live_metrics_in_menu_bar=True,
+            stats_refresh_interval=2,
         )
         assert config.base_path == "/custom/base"
         assert config.port == 9000
@@ -55,6 +57,7 @@ class TestServerConfig:
         assert config.launch_at_login is True
         assert config.start_server_on_launch is True
         assert config.show_live_metrics_in_menu_bar is True
+        assert config.stats_refresh_interval == 2
 
     def test_to_dict(self):
         """Test ServerConfig.to_dict() method."""
@@ -62,6 +65,7 @@ class TestServerConfig:
             base_path="/custom/base",
             port=8080,
             model_dir="/models",
+            stats_refresh_interval=10,
         )
         result = config.to_dict()
 
@@ -73,9 +77,11 @@ class TestServerConfig:
             "base_path", "port", "model_dir",
             "launch_at_login", "start_server_on_launch",
             "show_live_metrics_in_menu_bar",
+            "stats_refresh_interval",
         }
         assert set(result.keys()) == expected_keys
         assert result["show_live_metrics_in_menu_bar"] is False
+        assert result["stats_refresh_interval"] == 10
 
     def test_from_dict(self):
         """Test ServerConfig.from_dict() method."""
@@ -86,6 +92,7 @@ class TestServerConfig:
             "launch_at_login": True,
             "start_server_on_launch": False,
             "show_live_metrics_in_menu_bar": True,
+            "stats_refresh_interval": 10,
         }
         config = ServerConfig.from_dict(data)
 
@@ -95,6 +102,7 @@ class TestServerConfig:
         assert config.launch_at_login is True
         assert config.start_server_on_launch is False
         assert config.show_live_metrics_in_menu_bar is True
+        assert config.stats_refresh_interval == 10
 
     def test_from_dict_ignores_unknown_keys(self):
         """Test that from_dict ignores unknown keys."""
@@ -120,6 +128,16 @@ class TestServerConfig:
         assert config.base_path == str(Path.home() / ".omlx")  # default
         assert config.model_dir == ""  # default
         assert config.show_live_metrics_in_menu_bar is False
+        assert config.stats_refresh_interval == 5
+
+    @pytest.mark.parametrize(
+        "bad_interval", [0, 61, -1, "fast", 2.5, None, True, False]
+    )
+    def test_from_dict_invalid_stats_refresh_interval_uses_default(self, bad_interval):
+        """Invalid refresh intervals should fall back to the default value."""
+        config = ServerConfig.from_dict({"stats_refresh_interval": bad_interval})
+
+        assert config.stats_refresh_interval == 5
 
     def test_save_and_load(self, tmp_path: Path):
         """Test save and load round-trip."""
@@ -131,6 +149,7 @@ class TestServerConfig:
                 port=8888,
                 model_dir="/test/models",
                 show_live_metrics_in_menu_bar=True,
+                stats_refresh_interval=2,
             )
             original.save()
 
@@ -144,6 +163,7 @@ class TestServerConfig:
                 loaded.show_live_metrics_in_menu_bar
                 == original.show_live_metrics_in_menu_bar
             )
+            assert loaded.stats_refresh_interval == original.stats_refresh_interval
 
     def test_load_returns_default_on_missing_file(self, tmp_path: Path):
         """Test load returns default config when file doesn't exist."""

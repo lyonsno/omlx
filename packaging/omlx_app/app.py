@@ -222,10 +222,15 @@ class OMLXAppDelegate(NSObject):
         # Build menu
         self._build_menu()
 
-        # Start health check timer
+        # Update menu/icon immediately when the background server thread
+        # reports a state transition instead of waiting on the stats timer.
+        self.server_manager.set_status_callback(self._on_server_status_changed)
+
+        # Start health check timer with configurable interval
+        self._last_refresh_interval = self.config.stats_refresh_interval
         self.health_timer = (
             NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-                5.0, self, "healthCheck:", None, True
+                float(self._last_refresh_interval), self, "healthCheck:", None, True
             )
         )
         NSRunLoop.currentRunLoop().addTimer_forMode_(
@@ -911,6 +916,20 @@ class OMLXAppDelegate(NSObject):
         self._update_menubar_icon()
         self._build_menu()
 
+    def _on_server_status_changed(self, status):
+        """Schedule a UI refresh on the main thread after status transitions."""
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "serverStatusChangedOnMain:", status, False
+        )
+
+    def serverStatusChangedOnMain_(self, status):
+        """Main-thread UI refresh for background server status updates."""
+        if status != ServerStatus.RUNNING:
+            self._cached_stats = None
+            self._cached_alltime_stats = None
+            self._admin_session = None
+        self._update_status_display()
+
     # --- Stats fetching ---
 
     def _fetch_stats(self):
@@ -994,7 +1013,7 @@ class OMLXAppDelegate(NSObject):
         if self.server_manager.status == ServerStatus.RUNNING:
             # Refresh stats periodically
             now = time.time()
-            if now - self._last_stats_fetch >= 5:
+            if now - self._last_stats_fetch >= float(self._last_refresh_interval):
                 self._fetch_stats()
                 self._last_stats_fetch = now
                 self._build_menu()
@@ -1160,7 +1179,34 @@ class OMLXAppDelegate(NSObject):
     def _on_prefs_saved(self):
         """Callback after preferences are saved."""
         self.server_manager.update_config(self.config)
+        
+        # Restart timer if refresh interval changed
+        old_interval = self._last_refresh_interval
+        new_interval = self.config.stats_refresh_interval
+        
+        if old_interval != new_interval:
+            self._restart_health_timer(new_interval)
+            self._last_refresh_interval = new_interval
+        
         self._update_status_display()
+    
+    def _restart_health_timer(self, new_interval: float):
+        """Invalidate old timer and create new one with updated interval.
+        
+        Args:
+            new_interval: New refresh interval in seconds (1-60)
+        """
+        if self.health_timer:
+            self.health_timer.invalidate()
+        
+        self.health_timer = (
+            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                new_interval, self, "healthCheck:", None, True
+            )
+        )
+        NSRunLoop.currentRunLoop().addTimer_forMode_(
+            self.health_timer, NSDefaultRunLoopMode
+        )
 
     @objc.IBAction
     def showAbout_(self, sender):

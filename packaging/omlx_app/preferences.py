@@ -85,6 +85,8 @@ class PreferencesWindowController(NSObject):
         self.launch_at_login_checkbox = None
         self.auto_start_checkbox = None
         self.live_metrics_checkbox = None
+        self.refresh_interval_buttons = None
+        self._pending_stats_refresh_interval = config.stats_refresh_interval
         self.base_path_label = None
         self.model_dir_label = None
         self.port_field = None
@@ -386,6 +388,53 @@ class PreferencesWindowController(NSObject):
         )
         behavior_content.addSubview_(self.live_metrics_checkbox)
 
+        # Separator
+        cy -= 12
+        sep5 = self._create_separator()
+        sep5.setFrame_(NSMakeRect(16, cy, WINDOW_WIDTH - 96, 1))
+        behavior_content.addSubview_(sep5)
+
+        # Stats refresh rate
+        refresh_label_y, refresh_buttons_y = _behavior_refresh_row_positions(
+            BEHAVIOR_CARD_HEIGHT
+        )
+        refresh_label = NSTextField.labelWithString_("Stats refresh rate:")
+        refresh_label.setFont_(NSFont.systemFontOfSize_(12))
+        refresh_label.setFrame_(NSMakeRect(16, refresh_label_y, WINDOW_WIDTH - 96, 18))
+        behavior_content.addSubview_(refresh_label)
+
+        # Create refresh interval buttons (1s, 2s, 5s, 10s)
+        self.refresh_interval_buttons = []
+        interval_values = [1, 2, 5, 10]
+        button_width = 50
+        total_width = button_width * len(interval_values) + 10 * (len(interval_values) - 1)
+        start_x = (WINDOW_WIDTH - 48 - total_width) // 2
+        
+        for i, interval in enumerate(interval_values):
+            btn_x = start_x + i * (button_width + 10)
+            refresh_btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(btn_x, refresh_buttons_y, button_width, 22)
+            )
+            refresh_btn.setTitle_(f"{interval}s")
+            refresh_btn.setBezelStyle_(NSBezelStyleRounded)
+            refresh_btn.setFont_(NSFont.systemFontOfSize_(11))
+            refresh_btn.setTarget_(self)
+            refresh_btn.setAction_(
+                objc.selector(self._on_refresh_interval_changed, signature=b"v@:@")
+            )
+            # Set selected state if this is the current interval
+            refresh_btn.setState_(
+                NSControlStateValueOn
+                if self.config.stats_refresh_interval == interval
+                else NSControlStateValueOff
+            )
+            refresh_btn.setBordered_(True)
+            behavior_content.addSubview_(refresh_btn)
+            self.refresh_interval_buttons.append((interval, refresh_btn))
+        
+        # Update button styles to show selected one
+        self._update_refresh_interval_button_styles()
+
         y -= BEHAVIOR_CARD_HEIGHT + CARD_VERTICAL_GAP
 
         # === Actions Card ===
@@ -515,6 +564,47 @@ class PreferencesWindowController(NSObject):
             selected = str(panel.URL().path())
             self.model_dir_label.setStringValue_(selected)
 
+    def _on_refresh_interval_changed(self, sender):
+        """Update the selected stats refresh interval from the clicked button."""
+        if not self.refresh_interval_buttons:
+            return
+
+        for interval, button in self.refresh_interval_buttons:
+            if button is sender:
+                self._pending_stats_refresh_interval = interval
+                break
+
+        self._update_refresh_interval_button_styles()
+
+    def _update_refresh_interval_button_styles(self):
+        """Keep the refresh interval buttons in sync with the selected value."""
+        if not self.refresh_interval_buttons:
+            return
+
+        selected_interval = int(
+            getattr(
+                self,
+                "_pending_stats_refresh_interval",
+                getattr(self.config, "stats_refresh_interval", 5),
+            )
+            or 5
+        )
+        selected_font = NSFont.systemFontOfSize_weight_(11, 0.6)
+        unselected_font = NSFont.systemFontOfSize_(11)
+        selected_tint = NSColor.controlAccentColor()
+        unselected_tint = NSColor.secondaryLabelColor()
+        for interval, button in self.refresh_interval_buttons:
+            is_selected = interval == selected_interval
+            button.setState_(
+                NSControlStateValueOn if is_selected else NSControlStateValueOff
+            )
+            button.setBordered_(True)
+            button.setFont_(selected_font if is_selected else unselected_font)
+            if hasattr(button, "setContentTintColor_"):
+                button.setContentTintColor_(
+                    selected_tint if is_selected else unselected_tint
+                )
+
     @objc.IBAction
     def savePrefs_(self, sender):
         """Save preferences and apply changes."""
@@ -559,6 +649,20 @@ class PreferencesWindowController(NSObject):
         self.config.start_server_on_launch = bool(self.auto_start_checkbox.state())
         self.config.show_live_metrics_in_menu_bar = bool(
             self.live_metrics_checkbox.state()
+        )
+        self.config.stats_refresh_interval = max(
+            1,
+            min(
+                60,
+                int(
+                    getattr(
+                        self,
+                        "_pending_stats_refresh_interval",
+                        getattr(self.config, "stats_refresh_interval", 5),
+                    )
+                    or 5
+                ),
+            ),
         )
         self.config.save()
 
@@ -611,6 +715,7 @@ class PreferencesWindowController(NSObject):
     @objc.IBAction
     def closePrefs_(self, sender):
         """Close the preferences window without saving."""
+        self._pending_stats_refresh_interval = self.config.stats_refresh_interval
         self.window.close()
 
     @objc.IBAction
@@ -670,6 +775,7 @@ class PreferencesWindowController(NSObject):
             self.config.launch_at_login = False
             self.config.start_server_on_launch = False
             self.config.show_live_metrics_in_menu_bar = False
+            self.config.stats_refresh_interval = defaults.stats_refresh_interval
             self.config.save()
 
             self.base_path_label.setStringValue_(defaults.base_path)
@@ -689,6 +795,8 @@ class PreferencesWindowController(NSObject):
             self.launch_at_login_checkbox.setState_(NSControlStateValueOff)
             self.auto_start_checkbox.setState_(NSControlStateValueOff)
             self.live_metrics_checkbox.setState_(NSControlStateValueOff)
+            self._pending_stats_refresh_interval = defaults.stats_refresh_interval
+            self._update_refresh_interval_button_styles()
             self._original_base_path = defaults.base_path
 
             if self.on_save:

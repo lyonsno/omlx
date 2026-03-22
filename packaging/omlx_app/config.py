@@ -44,7 +44,7 @@ class ServerConfig:
     launch_at_login: bool = False
     start_server_on_launch: bool = False
     show_live_metrics_in_menu_bar: bool = False
-
+    stats_refresh_interval: int = 5  # seconds, 1-60 range
     def get_effective_model_dir(self) -> str:
         """Get the model directory, using base_path/models if not specified."""
         if self.model_dir:
@@ -63,8 +63,21 @@ class ServerConfig:
     def from_dict(cls, data: dict) -> "ServerConfig":
         valid_keys = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in data.items() if k in valid_keys}
-        return cls(**filtered)
 
+        # Validate and clamp stats_refresh_interval to 1-60 range
+        if "stats_refresh_interval" in filtered:
+            interval = filtered["stats_refresh_interval"]
+            if (
+                isinstance(interval, bool)
+                or not isinstance(interval, int)
+                or interval < 1
+                or interval > 60
+            ):
+                filtered["stats_refresh_interval"] = 5  # default
+            else:
+                filtered["stats_refresh_interval"] = max(1, min(60, interval))
+
+        return cls(**filtered)
     def save(self) -> None:
         with open(get_config_path(), "w") as f:
             json.dump(self.to_dict(), f, indent=2)

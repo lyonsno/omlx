@@ -822,3 +822,344 @@ class TestMenubarMonitoring:
 
         assert len(set(widths)) == 1
 
+
+class TestRefreshIntervalControls:
+    """Tests for the refresh interval controls in Preferences."""
+
+    @staticmethod
+    def _last_single_arg(mock_method):
+        assert mock_method.call_args_list, "Expected method to be called at least once"
+        args, kwargs = mock_method.call_args_list[-1]
+        assert not kwargs
+        assert len(args) == 1
+        return args[0]
+
+    def test_behavior_card_has_room_for_refresh_controls(self, preferences_module):
+        """The refresh controls should remain inside the Behavior card."""
+        label_y, buttons_y = preferences_module._behavior_refresh_row_positions()
+
+        assert label_y >= 16
+        assert buttons_y >= 14
+
+    def test_refresh_interval_selection_stages_button_state_without_mutating_config(
+        self, preferences_module
+    ):
+        """Selecting a refresh button should update the staged selection, not the live config."""
+        button_1 = Mock()
+        button_2 = Mock()
+        button_5 = Mock()
+        controller = types.SimpleNamespace(
+            config=types.SimpleNamespace(stats_refresh_interval=5),
+            refresh_interval_buttons=[
+                (1, button_1),
+                (2, button_2),
+                (5, button_5),
+            ],
+        )
+        controller._update_refresh_interval_button_styles = (
+            preferences_module.PreferencesWindowController._update_refresh_interval_button_styles.__get__(
+                controller
+            )
+        )
+        handler = (
+            preferences_module.PreferencesWindowController._on_refresh_interval_changed.__get__(
+                controller
+            )
+        )
+
+        handler(button_2)
+
+        assert controller.config.stats_refresh_interval == 5
+        button_1.setState_.assert_called_with(
+            preferences_module.NSControlStateValueOff
+        )
+        button_2.setState_.assert_called_with(
+            preferences_module.NSControlStateValueOn
+        )
+        button_5.setState_.assert_called_with(
+            preferences_module.NSControlStateValueOff
+        )
+        assert getattr(controller, "_pending_stats_refresh_interval", 2) == 2
+
+    def test_close_discards_unsaved_refresh_interval_selection(self, preferences_module):
+        """Closing preferences should discard staged refresh-rate changes."""
+        button_1 = Mock()
+        button_2 = Mock()
+        button_5 = Mock()
+        window = Mock()
+        controller = types.SimpleNamespace(
+            config=types.SimpleNamespace(stats_refresh_interval=5),
+            refresh_interval_buttons=[
+                (1, button_1),
+                (2, button_2),
+                (5, button_5),
+            ],
+            window=window,
+        )
+        controller._update_refresh_interval_button_styles = (
+            preferences_module.PreferencesWindowController._update_refresh_interval_button_styles.__get__(
+                controller
+            )
+        )
+        handler = (
+            preferences_module.PreferencesWindowController._on_refresh_interval_changed.__get__(
+                controller
+            )
+        )
+        close_prefs = (
+            preferences_module.PreferencesWindowController.closePrefs_.__get__(controller)
+        )
+
+        handler(button_2)
+        close_prefs(None)
+
+        assert controller.config.stats_refresh_interval == 5
+        window.close.assert_called_once_with()
+
+    def test_save_prefs_commits_staged_refresh_interval(self, preferences_module):
+        """Saving preferences should persist the staged refresh interval."""
+        base_path_label = Mock()
+        base_path_label.stringValue.return_value = "/tmp/.omlx"
+        model_dir_label = Mock()
+        model_dir_label.stringValue.return_value = "/tmp/.omlx/models"
+        port_field = Mock()
+        port_field.stringValue.return_value = "8000"
+        api_key_secure = Mock()
+        api_key_secure.stringValue.return_value = ""
+        api_key_plain = Mock()
+        api_key_plain.stringValue.return_value = ""
+        launch_at_login_checkbox = Mock()
+        launch_at_login_checkbox.state.return_value = 0
+        auto_start_checkbox = Mock()
+        auto_start_checkbox.state.return_value = 0
+        live_metrics_checkbox = Mock()
+        live_metrics_checkbox.state.return_value = 0
+
+        config = types.SimpleNamespace(
+            base_path="/tmp/.omlx",
+            port=8000,
+            model_dir="",
+            launch_at_login=False,
+            start_server_on_launch=False,
+            show_live_metrics_in_menu_bar=False,
+            stats_refresh_interval=5,
+            save=Mock(),
+        )
+        controller = types.SimpleNamespace(
+            config=config,
+            refresh_interval_buttons=[(2, Mock())],
+            _pending_stats_refresh_interval=2,
+            base_path_label=base_path_label,
+            model_dir_label=model_dir_label,
+            port_field=port_field,
+            _api_key_visible=False,
+            api_key_secure=api_key_secure,
+            api_key_plain=api_key_plain,
+            launch_at_login_checkbox=launch_at_login_checkbox,
+            auto_start_checkbox=auto_start_checkbox,
+            live_metrics_checkbox=live_metrics_checkbox,
+            server_manager=types.SimpleNamespace(status=object()),
+            _apply_launch_at_login=Mock(),
+            on_save=Mock(),
+            window=Mock(),
+        )
+        save_prefs = (
+            preferences_module.PreferencesWindowController.savePrefs_.__get__(controller)
+        )
+
+        save_prefs(None)
+
+        assert controller.config.stats_refresh_interval == 2
+        controller.config.save.assert_called_once_with()
+        controller.on_save.assert_called_once_with()
+        controller.window.close.assert_called_once_with()
+
+    def test_refresh_interval_styles_follow_selected_config(self, preferences_module):
+        """The selected refresh interval should be the only active button style."""
+        button_1 = Mock()
+        button_2 = Mock()
+        button_5 = Mock()
+        controller = types.SimpleNamespace(
+            config=types.SimpleNamespace(stats_refresh_interval=1),
+            refresh_interval_buttons=[
+                (1, button_1),
+                (2, button_2),
+                (5, button_5),
+            ],
+        )
+        updater = (
+            preferences_module.PreferencesWindowController._update_refresh_interval_button_styles.__get__(
+                controller
+            )
+        )
+
+        updater()
+
+        button_1.setState_.assert_called_with(
+            preferences_module.NSControlStateValueOn
+        )
+        button_2.setState_.assert_called_with(
+            preferences_module.NSControlStateValueOff
+        )
+        button_5.setState_.assert_called_with(
+            preferences_module.NSControlStateValueOff
+        )
+
+    def test_refresh_interval_styles_visibly_emphasize_selected_button(
+        self, preferences_module
+    ):
+        """The selected refresh interval should get a distinct visual treatment."""
+        button_1 = Mock()
+        button_2 = Mock()
+        button_5 = Mock()
+        controller = types.SimpleNamespace(
+            config=types.SimpleNamespace(stats_refresh_interval=2),
+            refresh_interval_buttons=[
+                (1, button_1),
+                (2, button_2),
+                (5, button_5),
+            ],
+        )
+        updater = (
+            preferences_module.PreferencesWindowController._update_refresh_interval_button_styles.__get__(
+                controller
+            )
+        )
+
+        updater()
+
+        selected_font = self._last_single_arg(button_2.setFont_)
+        unselected_font = self._last_single_arg(button_1.setFont_)
+        assert selected_font.weight is not None and selected_font.weight > 0
+        assert unselected_font.weight in (None, 0)
+        assert (
+            self._last_single_arg(button_2.setContentTintColor_)
+            == preferences_module.NSColor.controlAccentColor()
+        )
+        assert (
+            self._last_single_arg(button_1.setContentTintColor_)
+            == preferences_module.NSColor.secondaryLabelColor()
+        )
+
+
+class TestRefreshIntervalLifecycle:
+    """Tests for launch/save wiring of the refresh interval."""
+
+    def test_launch_schedules_health_timer_with_configured_interval(self, app_module):
+        """App launch should honor the configured refresh interval immediately."""
+        timer = object()
+        app_module.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_.return_value = (
+            timer
+        )
+        delegate = types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                stats_refresh_interval=2,
+                is_first_run=False,
+                start_server_on_launch=False,
+            ),
+            server_manager=Mock(),
+            status_item=None,
+            health_timer=None,
+            _icon_outline=None,
+            _icon_filled=None,
+            _load_menubar_icon=Mock(
+                side_effect=["outline-icon", "filled-icon"]
+            ),
+            _update_menubar_icon=Mock(),
+            _build_menu=Mock(),
+            _check_for_updates=Mock(),
+        )
+        delegate._on_server_status_changed = (
+            app_module.OMLXAppDelegate._on_server_status_changed.__get__(delegate)
+        )
+
+        app_module.OMLXAppDelegate._doFinishLaunching(delegate)
+
+        assert delegate.health_timer is timer
+        assert delegate._last_refresh_interval == 2
+        app_module.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_.assert_called_once_with(
+            2.0, delegate, "healthCheck:", None, True
+        )
+
+    def test_launch_registers_status_callback_for_immediate_ui_refresh(
+        self, app_module
+    ):
+        """Background status changes should not wait on the stats refresh timer."""
+        timer = object()
+        app_module.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_.return_value = (
+            timer
+        )
+        server_manager = Mock()
+        delegate = types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                stats_refresh_interval=10,
+                is_first_run=False,
+                start_server_on_launch=False,
+            ),
+            server_manager=server_manager,
+            status_item=None,
+            health_timer=None,
+            _icon_outline=None,
+            _icon_filled=None,
+            _load_menubar_icon=Mock(
+                side_effect=["outline-icon", "filled-icon"]
+            ),
+            _update_menubar_icon=Mock(),
+            _build_menu=Mock(),
+            _check_for_updates=Mock(),
+            _update_status_display=Mock(),
+            performSelectorOnMainThread_withObject_waitUntilDone_=Mock(
+                side_effect=lambda *args: delegate._update_status_display()
+            ),
+        )
+        delegate._on_server_status_changed = (
+            app_module.OMLXAppDelegate._on_server_status_changed.__get__(delegate)
+        )
+
+        app_module.OMLXAppDelegate._doFinishLaunching(delegate)
+
+        server_manager.set_status_callback.assert_called_once()
+        callback = server_manager.set_status_callback.call_args[0][0]
+        assert callable(callback)
+
+        callback(app_module.ServerStatus.RUNNING)
+
+        delegate._update_status_display.assert_called()
+
+    def test_prefs_save_restarts_timer_when_interval_changes(self, app_module):
+        """Saving prefs should restart the timer when the refresh interval changes."""
+        server_manager = Mock()
+        delegate = types.SimpleNamespace(
+            config=types.SimpleNamespace(stats_refresh_interval=2),
+            server_manager=server_manager,
+            _last_refresh_interval=5,
+            _restart_health_timer=Mock(),
+            _update_status_display=Mock(),
+        )
+
+        app_module.OMLXAppDelegate._on_prefs_saved(delegate)
+
+        server_manager.update_config.assert_called_once_with(delegate.config)
+        delegate._restart_health_timer.assert_called_once_with(2)
+        assert delegate._last_refresh_interval == 2
+        delegate._update_status_display.assert_called_once_with()
+
+    def test_prefs_save_skips_timer_restart_when_interval_is_unchanged(
+        self, app_module
+    ):
+        """Saving prefs should not restart the timer when the interval is unchanged."""
+        server_manager = Mock()
+        delegate = types.SimpleNamespace(
+            config=types.SimpleNamespace(stats_refresh_interval=5),
+            server_manager=server_manager,
+            _last_refresh_interval=5,
+            _restart_health_timer=Mock(),
+            _update_status_display=Mock(),
+        )
+
+        app_module.OMLXAppDelegate._on_prefs_saved(delegate)
+
+        server_manager.update_config.assert_called_once_with(delegate.config)
+        delegate._restart_health_timer.assert_not_called()
+        assert delegate._last_refresh_interval == 5
+        delegate._update_status_display.assert_called_once_with()
