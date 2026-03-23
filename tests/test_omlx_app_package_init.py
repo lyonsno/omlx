@@ -105,3 +105,26 @@ def test_omlx_app_app_module_does_not_import_omlx_runtime(monkeypatch):
                 sys.modules.pop(mod_name, None)
             else:
                 sys.modules[mod_name] = prior
+
+
+def test_omlx_app_init_loads_version_from_resources_layout(tmp_path, monkeypatch):
+    """Bundle-like Resources layout should resolve omlx/_version.py correctly."""
+    packaging_dir = Path(__file__).parent.parent / "packaging"
+    monkeypatch.syspath_prepend(str(packaging_dir))
+
+    sys.modules.pop("omlx_app", None)
+    module = importlib.import_module("omlx_app")
+
+    bundle_init = (
+        tmp_path / "oMLX.app" / "Contents" / "Resources" / "omlx_app" / "__init__.py"
+    )
+    bundle_init.parent.mkdir(parents=True, exist_ok=True)
+    bundle_init.write_text("# bundle stub\n", encoding="utf-8")
+
+    version_file = tmp_path / "oMLX.app" / "Contents" / "Resources" / "omlx" / "_version.py"
+    version_file.parent.mkdir(parents=True, exist_ok=True)
+    version_file.write_text('__version__ = "9.9.9"\n', encoding="utf-8")
+
+    monkeypatch.setattr(module, "__file__", str(bundle_init))
+
+    assert module._load_version() == "9.9.9"
