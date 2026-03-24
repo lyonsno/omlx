@@ -6,15 +6,14 @@ A native macOS menubar app for managing the oMLX LLM inference server.
 
 import logging
 import platform
+import re
+import threading
 import time
 import webbrowser
 from pathlib import Path
-from typing import Optional
 
 import objc
 import requests
-
-from omlx._version import __version__
 from AppKit import (
     NSApp,
     NSAppearanceNameDarkAqua,
@@ -31,8 +30,9 @@ from AppKit import (
     NSStatusBar,
     NSVariableStatusItemLength,
 )
-from Foundation import NSData, NSObject, NSRunLoop, NSDefaultRunLoopMode, NSTimer
+from Foundation import NSData, NSDefaultRunLoopMode, NSObject, NSRunLoop, NSTimer
 
+from . import __version__
 from .config import ServerConfig
 from .server_manager import PortConflict, ServerManager, ServerStatus
 
@@ -80,13 +80,17 @@ class OMLXAppDelegate(NSObject):
         self.health_timer = None
         self.welcome_controller = None
         self.preferences_controller = None
-        self._cached_stats: Optional[dict] = None
-        self._cached_alltime_stats: Optional[dict] = None
+        self._cached_stats: dict | None = None
+        self._cached_alltime_stats: dict | None = None
         self._last_stats_fetch: float = 0
-        self._admin_session: Optional[requests.Session] = None
-        self._icon_outline: Optional[NSImage] = None
-        self._icon_filled: Optional[NSImage] = None
-        self._update_info: Optional[dict] = None
+        self._last_stats_refresh_started_at: float = 0
+        self._stats_refresh_in_flight: bool = False
+        self._stats_refresh_token: int = 0
+        self._last_health_status: ServerStatus | None = None
+        self._admin_session: requests.Session | None = None
+        self._icon_outline: NSImage | None = None
+        self._icon_filled: NSImage | None = None
+        self._update_info: dict | None = None
         self._last_update_check: float = 0
         self._updater = None  # AppUpdater instance during download
         self._update_progress_text = ""  # Current download progress text
@@ -126,6 +130,11 @@ class OMLXAppDelegate(NSObject):
 
         # Build menu
         self._build_menu()
+
+        # React to actual server status transitions instead of waiting for the
+        # next menubar timer sample. This closes fast flap windows where a
+        # crash/restart can happen entirely between UI ticks.
+        self.server_manager.set_status_callback(self._on_server_status_changed)
 
         # Start health check timer
         self.health_timer = (
@@ -187,14 +196,12 @@ class OMLXAppDelegate(NSObject):
             if (res / "navbar-logo-dark.svg").exists():
                 return res
         # Development fallback: omlx/admin/static/
-        dev_path = (
-            Path(__file__).parent.parent.parent / "omlx" / "admin" / "static"
-        )
+        dev_path = Path(__file__).parent.parent.parent / "omlx" / "admin" / "static"
         if dev_path.exists():
             return dev_path
         return Path(__file__).parent
 
-    def _load_menubar_icon(self, svg_name: str) -> Optional[NSImage]:
+    def _load_menubar_icon(self, svg_name: str) -> NSImage | None:
         """Load an SVG file as a template image for the menubar.
 
         Template images automatically adapt to menubar background:
@@ -302,12 +309,47 @@ class OMLXAppDelegate(NSObject):
             self._update_info = None
 
     def _is_newer_version(self, latest: str, current: str) -> bool:
-        """PEP 440 version comparison. Ignores pre-release versions."""
-        try:
-            from packaging.version import Version
+        """Compare simple dotted versions without runtime dependency on packaging."""
 
-            latest_ver = Version(latest)
-            return latest_ver > Version(current) and not latest_ver.is_prerelease
+        def _parse_for_compare(value: str) -> tuple[tuple[int, ...], bool, int, int]:
+            normalized = value.strip().lstrip("vV")
+            if not normalized:
+                return (), True, -1, 0
+
+            # Ignore local-version metadata when comparing update availability.
+            normalized = normalized.split("+", 1)[0].lower()
+            match = re.fullmatch(
+                r"(?P<release>\d+(?:\.\d+)*)(?:(?P<pre_tag>a|b|rc)(?P<pre_num>\d*))?(?:\.post(?P<post_num>\d+))?",
+                normalized,
+            )
+            if not match:
+                return (), True, -1, 0
+
+            release = [int(part) for part in match.group("release").split(".")]
+
+            while release and release[-1] == 0:
+                release.pop()
+
+            if match.group("pre_tag"):
+                return tuple(release), True, 0, int(match.group("pre_num") or "0")
+            if match.group("post_num"):
+                return tuple(release), False, 2, int(match.group("post_num"))
+            return tuple(release), False, 1, 0
+
+        try:
+            latest_release, latest_is_prerelease, latest_stage, latest_stage_num = (
+                _parse_for_compare(latest)
+            )
+            current_release, _, current_stage, current_stage_num = _parse_for_compare(
+                current
+            )
+            if latest_is_prerelease or not latest_release:
+                return False
+            if latest_release > current_release:
+                return True
+            if latest_release < current_release:
+                return False
+            return (latest_stage, latest_stage_num) > (current_stage, current_stage_num)
         except Exception:
             return False
 
@@ -324,9 +366,7 @@ class OMLXAppDelegate(NSObject):
         from AppKit import NSAlert, NSAlertFirstButtonReturn
 
         alert = NSAlert.alloc().init()
-        alert.setMessageText_(
-            f"Update to oMLX {self._update_info['version']}?"
-        )
+        alert.setMessageText_(f"Update to oMLX {self._update_info['version']}?")
 
         notes = self._update_info.get("notes", "")
         if len(notes) > 500:
@@ -412,8 +452,7 @@ class OMLXAppDelegate(NSObject):
         alert = NSAlert.alloc().init()
         alert.setMessageText_("Update Failed")
         alert.setInformativeText_(
-            f"{message}\n\n"
-            "Would you like to download the update manually?"
+            f"{message}\n\nWould you like to download the update manually?"
         )
         alert.addButtonWithTitle_("Open GitHub")
         alert.addButtonWithTitle_("Cancel")
@@ -461,14 +500,14 @@ class OMLXAppDelegate(NSObject):
 
     # --- Menu building ---
 
-    def _create_menu_icon(self, sf_symbol: str) -> Optional[NSImage]:
+    def _create_menu_icon(self, sf_symbol: str) -> NSImage | None:
         """Create a menu item icon from SF Symbol (macOS 11+).
 
         Returns a template image that automatically adapts to menu theme.
         """
         try:
             # macOS 11+ SF Symbols support
-            if hasattr(NSImage, 'imageWithSystemSymbolName_accessibilityDescription_'):
+            if hasattr(NSImage, "imageWithSystemSymbolName_accessibilityDescription_"):
                 icon = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
                     sf_symbol, None
                 )
@@ -527,16 +566,12 @@ class OMLXAppDelegate(NSObject):
                 update_text = f"⬇️ {progress}"
                 update_action = None
             else:
-                update_text = (
-                    f"🔔 Update Available ({self._update_info['version']})"
-                )
+                update_text = f"🔔 Update Available ({self._update_info['version']})"
                 update_action = "openUpdate:"
 
-            attributed_update = (
-                NSAttributedString.alloc().initWithString_attributes_(
-                    update_text,
-                    {NSForegroundColorAttributeName: NSColor.systemGreenColor()},
-                )
+            attributed_update = NSAttributedString.alloc().initWithString_attributes_(
+                update_text,
+                {NSForegroundColorAttributeName: NSColor.systemGreenColor()},
             )
             update_item = NSMenuItem.alloc().init()
             update_item.setAttributedTitle_(attributed_update)
@@ -734,10 +769,51 @@ class OMLXAppDelegate(NSObject):
         self._update_menubar_icon()
         self._build_menu()
 
+    def _close_admin_session(self):
+        """Close the cached admin session if present."""
+        session = self._admin_session
+        self._admin_session = None
+        self._close_session(session)
+
+    def _close_session(self, session):
+        """Close a requests session if present."""
+        if session is None:
+            return
+        try:
+            session.close()
+        except Exception as e:
+            logger.debug(f"Failed closing session: {e}")
+
+    def _invalidate_stats_refresh_generation(self):
+        """Discard refresh results and timing state from an old server generation."""
+        self._stats_refresh_token += 1
+        self._last_stats_fetch = 0
+        self._last_stats_refresh_started_at = 0
+        self._stats_refresh_in_flight = False
+        self._cached_stats = None
+        self._cached_alltime_stats = None
+        self._close_admin_session()
+
+    def _on_server_status_changed(self, status):
+        """Marshal background server status changes onto the main thread."""
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "serverStatusChangedOnMain:", status, False
+        )
+
+    def serverStatusChangedOnMain_(self, status):
+        """Main-thread handling for immediate status transition updates."""
+        previous_status = getattr(self, "_last_health_status", None)
+        if previous_status == ServerStatus.RUNNING and status != ServerStatus.RUNNING:
+            self._invalidate_stats_refresh_generation()
+        self._last_health_status = status
+        self._update_status_display()
+
     # --- Stats fetching ---
 
-    def _fetch_stats(self):
-        """Fetch serving stats from the admin API.
+    def _fetch_stats_snapshot(
+        self, session: requests.Session | None = None
+    ) -> tuple[dict | None, dict | None, requests.Session | None]:
+        """Fetch serving stats from the admin API and return a snapshot.
 
         Reuses a persistent session to avoid re-login on every poll cycle.
         Only calls /admin/api/login when the session cookie is missing or
@@ -748,14 +824,10 @@ class OMLXAppDelegate(NSObject):
             base_url = f"http://127.0.0.1:{self.config.port}"
 
             if not api_key:
-                self._cached_stats = None
-                self._cached_alltime_stats = None
-                return
+                return None, None, None
 
-            if self._admin_session is None:
-                self._admin_session = requests.Session()
-
-            session = self._admin_session
+            if session is None:
+                session = requests.Session()
 
             # Try fetching stats directly (session cookie may still be valid)
             stats_resp = session.get(
@@ -771,10 +843,8 @@ class OMLXAppDelegate(NSObject):
                     timeout=2,
                 )
                 if login_resp.status_code != 200:
-                    self._cached_stats = None
-                    self._cached_alltime_stats = None
-                    self._admin_session = None
-                    return
+                    self._close_session(session)
+                    return None, None, None
 
                 stats_resp = session.get(
                     f"{base_url}/admin/api/stats",
@@ -782,11 +852,10 @@ class OMLXAppDelegate(NSObject):
                 )
 
             if stats_resp.status_code == 200:
-                self._cached_stats = stats_resp.json()
+                stats = stats_resp.json()
             else:
-                self._cached_stats = None
-                self._cached_alltime_stats = None
-                return
+                self._close_session(session)
+                return None, None, None
 
             alltime_resp = session.get(
                 f"{base_url}/admin/api/stats",
@@ -794,16 +863,105 @@ class OMLXAppDelegate(NSObject):
                 timeout=2,
             )
             if alltime_resp.status_code == 200:
-                self._cached_alltime_stats = alltime_resp.json()
+                alltime = alltime_resp.json()
             else:
-                self._cached_alltime_stats = None
+                alltime = None
+
+            return stats, alltime, session
 
         except requests.RequestException:
-            self._cached_stats = None
-            self._cached_alltime_stats = None
-            self._admin_session = None
+            self._close_session(session)
+            return None, None, None
 
     # --- Timer callback ---
+
+    def _start_stats_refresh(self):
+        """Queue a non-blocking stats refresh worker."""
+        refresh_token = self._stats_refresh_token
+        refresh_session = self._admin_session
+
+        def _worker():
+            try:
+                stats, alltime_stats, session = self._fetch_stats_snapshot(
+                    refresh_session
+                )
+                finished_at = time.time()
+                self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "statsRefreshFinishedOnMain:",
+                    {
+                        "token": refresh_token,
+                        "finished_at": finished_at,
+                        "stats": stats,
+                        "alltime_stats": alltime_stats,
+                        "session": session,
+                    },
+                    False,
+                )
+            except Exception as e:
+                # requests failures are already handled in _fetch_stats; this is a
+                # hardening fallback so the in-flight guard never gets stuck.
+                self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "statsRefreshFailedOnMain:",
+                    {"token": refresh_token, "error": str(e)},
+                    False,
+                )
+
+        threading.Thread(
+            target=_worker,
+            name="omlx-stats-refresh",
+            daemon=True,
+        ).start()
+
+    def statsRefreshFinishedOnMain_(self, payload):
+        """Main-thread completion for async stats refresh."""
+        if not isinstance(payload, dict):
+            logger.debug("Async stats refresh returned unexpected payload type")
+            self._stats_refresh_in_flight = False
+            self._update_menubar_icon()
+            return
+
+        token = payload.get("token")
+        finished_at = payload.get("finished_at")
+        stats = payload.get("stats")
+        alltime_stats = payload.get("alltime_stats")
+        session = payload.get("session")
+
+        if token is not None and token != self._stats_refresh_token:
+            self._close_session(session)
+            return
+        self._stats_refresh_in_flight = False
+        if self.server_manager.status != ServerStatus.RUNNING:
+            self._close_session(session)
+            return
+
+        try:
+            self._last_stats_fetch = float(finished_at)
+        except (TypeError, ValueError):
+            self._last_stats_fetch = time.time()
+        self._cached_stats = stats
+        self._cached_alltime_stats = alltime_stats
+        self._admin_session = session
+        self._build_menu()
+        self._update_menubar_icon()
+
+    def statsRefreshFailedOnMain_(self, payload):
+        """Main-thread failure path for async stats refresh."""
+        if not isinstance(payload, dict):
+            self._stats_refresh_in_flight = False
+            if payload:
+                logger.debug(f"Async stats refresh failed: {payload}")
+            self._update_menubar_icon()
+            return
+
+        token = payload.get("token")
+        error_message = payload.get("error")
+
+        if token is not None and token != self._stats_refresh_token:
+            return
+        self._stats_refresh_in_flight = False
+        if error_message:
+            logger.debug(f"Async stats refresh failed: {error_message}")
+        self._update_menubar_icon()
 
     def healthCheck_(self, timer):
         """Periodic icon/menu update and stats refresh.
@@ -812,29 +970,56 @@ class OMLXAppDelegate(NSObject):
         ServerManager._health_check_loop in a background thread.
         This timer only refreshes the UI.
         """
-        prev_status = self.server_manager.status
+        current_status = self.server_manager.status
+        # Status callbacks may have updated this value already; this timer path
+        # acts as a fallback for transitions missed before the current tick.
+        previous_status = getattr(self, "_last_health_status", None)
 
-        if self.server_manager.status == ServerStatus.RUNNING:
+        if current_status == ServerStatus.RUNNING:
             # Refresh stats periodically
             now = time.time()
-            if now - self._last_stats_fetch >= 5:
-                self._fetch_stats()
-                self._last_stats_fetch = now
-                self._build_menu()
+            if (
+                self._stats_refresh_in_flight
+                and now - self._last_stats_refresh_started_at > 15
+            ):
+                logger.warning(
+                    "Stats refresh exceeded watchdog timeout; invalidating generation"
+                )
+                self._invalidate_stats_refresh_generation()
+            if (
+                now - self._last_stats_refresh_started_at >= 5
+                and not self._stats_refresh_in_flight
+            ):
+                self._stats_refresh_in_flight = True
+                self._last_stats_refresh_started_at = now
+                try:
+                    self._start_stats_refresh()
+                except Exception:
+                    self._stats_refresh_in_flight = False
 
-        elif self.server_manager.status in (
+        elif current_status in (
             ServerStatus.ERROR,
             ServerStatus.UNRESPONSIVE,
+            ServerStatus.STARTING,
+            ServerStatus.STOPPING,
+            ServerStatus.STOPPED,
         ):
-            self._cached_stats = None
-            self._cached_alltime_stats = None
+            if previous_status == ServerStatus.RUNNING:
+                # Fallback invalidation in case the status callback was not
+                # observed before this timer sample.
+                self._invalidate_stats_refresh_generation()
+            else:
+                self._cached_stats = None
+                self._cached_alltime_stats = None
+                self._stats_refresh_in_flight = False
 
         # Update icon/menu if status changed
-        if self.server_manager.status != prev_status:
+        if previous_status is not None and current_status != previous_status:
             self._update_status_display()
 
         # Always refresh icon in case theme changed
         self._update_menubar_icon()
+        self._last_health_status = current_status
 
     # --- Menu actions ---
 
@@ -867,6 +1052,7 @@ class OMLXAppDelegate(NSObject):
                 if conflict.pid:
                     self.server_manager._kill_external_server(conflict.pid)
                     import time
+
                     time.sleep(0.5)
                 result = self.server_manager.start()
                 if isinstance(result, PortConflict):
@@ -904,15 +1090,13 @@ class OMLXAppDelegate(NSObject):
     def stopServer_(self, sender):
         """Stop the server."""
         self.server_manager.stop()
-        self._cached_stats = None
-        self._cached_alltime_stats = None
-        self._admin_session = None
+        self._invalidate_stats_refresh_generation()
         self._update_status_display()
 
     @objc.IBAction
     def forceRestart_(self, sender):
         """Force restart the server (kill + start fresh)."""
-        self._admin_session = None
+        self._invalidate_stats_refresh_generation()
         result = self.server_manager.force_restart()
         if isinstance(result, PortConflict):
             self._handle_port_conflict(result)
