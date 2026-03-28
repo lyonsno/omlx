@@ -1,0 +1,36 @@
+# Minimal Spoke-oriented MCP loadout for oMLX.
+#
+# This keeps the first tool surface intentionally small:
+# - Brave web search for discovery
+# - Fetch for reading specific pages
+#
+# For the Brave server, either:
+# 1. Replace REPLACE_WITH_BRAVE_API_KEY below, or
+# 2. Remove the env block and launch oMLX with BRAVE_API_KEY already set.
+servers:
+  brave-search:
+    transport: stdio
+    command: npx
+    args:
+      - -y
+      - "@brave/brave-search-mcp-server"
+      - --transport
+      - stdio
+      - --enabled-tools
+      - brave_web_search
+    env:
+      BRAVE_API_KEY: REPLACE_WITH_BRAVE_API_KEY
+      BRAVE_MCP_LOG_LEVEL: warning
+    enabled: true
+    timeout: 30
+
+  fetch:
+    transport: stdio
+    command: uvx
+    args:
+      - mcp-server-fetch
+    enabled: true
+    timeout: 45
+
+max_tool_calls: 6
+default_timeout: 45.0
