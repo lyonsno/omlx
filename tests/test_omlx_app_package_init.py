@@ -128,3 +128,25 @@ def test_omlx_app_init_loads_version_from_resources_layout(tmp_path, monkeypatch
     monkeypatch.setattr(module, "__file__", str(bundle_init))
 
     assert module._load_version() == "9.9.9"
+
+
+def test_omlx_app_init_logs_warning_when_version_fallback_used(
+    tmp_path, monkeypatch, caplog
+):
+    """Missing version files should emit a warning before falling back to 0.0.0."""
+    packaging_dir = Path(__file__).parent.parent / "packaging"
+    monkeypatch.syspath_prepend(str(packaging_dir))
+
+    sys.modules.pop("omlx_app", None)
+    module = importlib.import_module("omlx_app")
+
+    missing_init = tmp_path / "omlx_app" / "__init__.py"
+    missing_init.parent.mkdir(parents=True, exist_ok=True)
+    missing_init.write_text("# missing-version stub\n", encoding="utf-8")
+
+    monkeypatch.setattr(module, "__file__", str(missing_init))
+
+    with caplog.at_level("WARNING"):
+        assert module._load_version() == "0.0.0"
+
+    assert "Falling back to default oMLX version 0.0.0" in caplog.text

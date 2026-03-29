@@ -6,7 +6,6 @@ A native macOS menubar app for managing the oMLX LLM inference server.
 
 import logging
 import platform
-import re
 import threading
 import time
 import webbrowser
@@ -31,6 +30,7 @@ from AppKit import (
     NSVariableStatusItemLength,
 )
 from Foundation import NSData, NSDefaultRunLoopMode, NSObject, NSRunLoop, NSTimer
+from packaging.version import InvalidVersion, Version
 
 from . import __version__
 from .config import ServerConfig
@@ -309,49 +309,13 @@ class OMLXAppDelegate(NSObject):
             self._update_info = None
 
     def _is_newer_version(self, latest: str, current: str) -> bool:
-        """Compare simple dotted versions without runtime dependency on packaging."""
-
-        def _parse_for_compare(value: str) -> tuple[tuple[int, ...], bool, int, int]:
-            normalized = value.strip().lstrip("vV")
-            if not normalized:
-                return (), True, -1, 0
-
-            # Ignore local-version metadata when comparing update availability.
-            normalized = normalized.split("+", 1)[0].lower()
-            match = re.fullmatch(
-                r"(?P<release>\d+(?:\.\d+)*)(?:(?P<pre_tag>a|b|rc)(?P<pre_num>\d*))?(?:\.post(?P<post_num>\d+))?",
-                normalized,
-            )
-            if not match:
-                return (), True, -1, 0
-
-            release = [int(part) for part in match.group("release").split(".")]
-
-            while release and release[-1] == 0:
-                release.pop()
-
-            if match.group("pre_tag"):
-                return tuple(release), True, 0, int(match.group("pre_num") or "0")
-            if match.group("post_num"):
-                return tuple(release), False, 2, int(match.group("post_num"))
-            return tuple(release), False, 1, 0
-
+        """Compare release versions using packaging's PEP 440 parser."""
         try:
-            latest_release, latest_is_prerelease, latest_stage, latest_stage_num = (
-                _parse_for_compare(latest)
-            )
-            current_release, _, current_stage, current_stage_num = _parse_for_compare(
-                current
-            )
-            if latest_is_prerelease or not latest_release:
-                return False
-            if latest_release > current_release:
-                return True
-            if latest_release < current_release:
-                return False
-            return (latest_stage, latest_stage_num) > (current_stage, current_stage_num)
-        except Exception:
+            latest_version = Version(latest.strip().lstrip("vV"))
+            current_version = Version(current.strip().lstrip("vV"))
+        except InvalidVersion:
             return False
+        return latest_version > current_version and not latest_version.is_prerelease
 
     def openUpdate_(self, sender):
         """Show confirmation dialog and start auto-update."""
@@ -816,6 +780,9 @@ class OMLXAppDelegate(NSObject):
         """Fetch serving stats from the admin API and return a snapshot.
 
         Reuses a persistent session to avoid re-login on every poll cycle.
+        The caller only hands a session to one refresh worker at a time, so
+        the cached session is reused serially rather than shared by overlapping
+        worker threads.
         Only calls /admin/api/login when the session cookie is missing or
         expired (server returns 401).
         """
@@ -877,7 +844,11 @@ class OMLXAppDelegate(NSObject):
 
     def _start_stats_refresh(self):
         """Queue a non-blocking stats refresh worker."""
+        # The main thread owns the in-flight/token guards. Workers only receive
+        # snapshots and hand completion back onto the main thread.
         refresh_token = self._stats_refresh_token
+        # The cached Session is reused serially because `_stats_refresh_in_flight`
+        # prevents overlapping refresh workers.
         refresh_session = self._admin_session
 
         def _worker():
@@ -940,6 +911,8 @@ class OMLXAppDelegate(NSObject):
             self._last_stats_fetch = time.time()
         self._cached_stats = stats
         self._cached_alltime_stats = alltime_stats
+        # Adopt the refreshed session only after the generation token matches
+        # and the server is still in the running generation.
         self._admin_session = session
         self._build_menu()
         self._update_menubar_icon()

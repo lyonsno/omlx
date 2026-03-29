@@ -1,7 +1,10 @@
 """oMLX Menubar App - macOS menubar application for oMLX server management."""
 
+import logging
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def _load_version_from_file(version_file: Path) -> str | None:
@@ -38,6 +41,10 @@ def _load_version() -> str:
         if isinstance(version, str) and version:
             return version
 
+    logger.warning(
+        "Falling back to default oMLX version 0.0.0; could not load any of: %s",
+        ", ".join(str(path) for path in candidates) if candidates else "<no candidates>",
+    )
     return "0.0.0"
 
 

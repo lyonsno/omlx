@@ -840,25 +840,15 @@ class TestAsyncStatsRefreshContract:
         assert returned_session is None
         session.close.assert_called_once()
 
-    def test_is_newer_version_works_without_packaging_dependency(
-        self, app_module, monkeypatch
-    ):
-        """Version checks should not depend on importing third-party packaging.version."""
+    def test_is_newer_version_uses_packaging_pep440_semantics(self, app_module):
+        """Version checks should follow packaging's PEP 440 parser semantics."""
         delegate = types.SimpleNamespace()
-        orig_import = __import__
-
-        def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
-            if name == "packaging.version" or (
-                name == "packaging" and "version" in fromlist
-            ):
-                raise ModuleNotFoundError("simulated missing packaging.version")
-            return orig_import(name, globals, locals, fromlist, level)
-
-        monkeypatch.setattr("builtins.__import__", guarded_import)
-
         assert app_module.OMLXAppDelegate._is_newer_version(delegate, "1.10.0", "1.9.9")
         assert app_module.OMLXAppDelegate._is_newer_version(
             delegate, "v1.10.0", "1.9.9"
+        )
+        assert app_module.OMLXAppDelegate._is_newer_version(
+            delegate, "1!0.2.20", "0.2.20"
         )
         assert app_module.OMLXAppDelegate._is_newer_version(
             delegate, "0.2.20", "0.2.20rc1"
@@ -870,5 +860,11 @@ class TestAsyncStatsRefreshContract:
             delegate, "1.10.0rc1", "1.9.9"
         )
         assert not app_module.OMLXAppDelegate._is_newer_version(
+            delegate, "1.10.0.dev1", "1.9.9"
+        )
+        assert not app_module.OMLXAppDelegate._is_newer_version(
             delegate, "1.9.0", "1.10.0"
+        )
+        assert not app_module.OMLXAppDelegate._is_newer_version(
+            delegate, "not-a-version", "1.10.0"
         )
