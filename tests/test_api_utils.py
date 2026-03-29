@@ -36,6 +36,7 @@ from omlx.api.openai_models import ContentPart, FunctionCall, Message, ToolCall
 from omlx.api.anthropic_models import (
     AnthropicMessage,
     AnthropicTool,
+    ContentBlockDocument,
     ContentBlockText,
     ContentBlockToolResult,
     ContentBlockToolUse,
@@ -244,6 +245,8 @@ class TestExtractTextContent:
         result = extract_text_content(messages)
 
         assert "Hello" in result[0]["content"]
+        # Ensure content is a string, not a list
+        assert isinstance(result[0]["content"], str)
 
     def test_none_content(self):
         """Test extracting message with None content."""
@@ -269,6 +272,25 @@ class TestExtractTextContent:
         assert result[0]["role"] == "user"  # Converted to user
         assert "call_123" in result[0]["content"]
         assert "success" in result[0]["content"]
+
+    def test_tool_response_message_with_content_part_list(self):
+        """Test extracting tool response with ContentPart list content."""
+        messages = [
+            Message(
+                role="tool",
+                content=[ContentPart(type="text", text='{"result": "success"}')],
+                tool_call_id="call_123",
+            )
+        ]
+
+        result = extract_text_content(messages)
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"  # Converted to user
+        assert "call_123" in result[0]["content"]
+        assert "success" in result[0]["content"]
+        # Ensure content is a string, not a list
+        assert isinstance(result[0]["content"], str)
 
     def test_tool_response_fallback_preserves_role_boundary(self):
         """Fallback tool history must not merge into adjacent user turns."""
@@ -581,6 +603,247 @@ class TestConvertAnthropicToInternal:
         assert result[1]["tool_call_id"] == "toolu_123"
         assert result[1]["content"] == "The weather is sunny"
 
+    def test_tool_result_with_image_preserve_images_nonnative(self):
+        """Images in tool_result content are preserved when preserve_images=True (non-native path)."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_img",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "iVBOR",
+                                    },
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "screenshot.png",
+                                },
+                            ],
+                        }
+                    ],
+                )
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request, preserve_images=True)
+
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        image_parts = [p for p in content if p.get("type") == "image_url"]
+        text_parts = [p for p in content if p.get("type") == "text"]
+        assert len(image_parts) == 1
+        assert "iVBOR" in image_parts[0]["image_url"]["url"]
+        assert len(text_parts) == 1
+        assert "toolu_img" in text_parts[0]["text"]
+
+    def test_tool_result_with_image_no_preserve(self):
+        """Images in tool_result content are NOT preserved when preserve_images=False."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_img",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "iVBOR",
+                                    },
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "screenshot.png",
+                                },
+                            ],
+                        }
+                    ],
+                )
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request, preserve_images=False)
+
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, str)
+        assert "screenshot.png" in content
+        assert "iVBOR" not in content
+
+    def test_tool_result_with_image_native_path(self):
+        """Images in tool_result are preserved in native tool calling path."""
+        class NativeToolTokenizer:
+            has_tool_calling = True
+
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockToolUse(
+                            id="toolu_img",
+                            name="read_file",
+                            input={"path": "/tmp/screenshot.png"},
+                        ),
+                    ],
+                ),
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_img",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "iVBOR",
+                                    },
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "screenshot.png",
+                                },
+                            ],
+                        }
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(
+            request,
+            tokenizer=NativeToolTokenizer(),
+            preserve_images=True,
+        )
+
+        # assistant message with tool_calls
+        assert result[0]["role"] == "assistant"
+        # tool result (text only)
+        assert result[1]["role"] == "tool"
+        assert result[1]["content"] == "screenshot.png"
+        # user message with extracted image
+        assert result[2]["role"] == "user"
+        content = result[2]["content"]
+        assert isinstance(content, list)
+        image_parts = [p for p in content if p.get("type") == "image_url"]
+        assert len(image_parts) == 1
+        assert "iVBOR" in image_parts[0]["image_url"]["url"]
+
+    def test_document_block_text_plain(self):
+        """Test converting text/plain document block decodes content."""
+        import base64
+
+        text_data = base64.b64encode(b"Hello from document").decode()
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        ContentBlockDocument(
+                            source={
+                                "type": "base64",
+                                "media_type": "text/plain",
+                                "data": text_data,
+                            },
+                            title="notes.txt",
+                        ),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request)
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert "Hello from document" in result[0]["content"]
+        assert "[Document: notes.txt]" in result[0]["content"]
+
+    def test_document_block_pdf_placeholder(self):
+        """Test converting PDF document block returns placeholder."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        ContentBlockDocument(
+                            source={
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": "JVBERi0xLjQ=",
+                            },
+                            title="manual.pdf",
+                        ),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request)
+
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert "manual.pdf" in content
+        assert "oMLX does not provide PDF parsing" in content
+
+    def test_document_block_mixed_with_text(self):
+        """Test document block alongside text blocks."""
+        import base64
+
+        text_data = base64.b64encode(b"Doc content here").decode()
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        ContentBlockText(text="Please read this:"),
+                        ContentBlockDocument(
+                            source={
+                                "type": "base64",
+                                "media_type": "text/plain",
+                                "data": text_data,
+                            },
+                        ),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request)
+
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert "Please read this:" in content
+        assert "Doc content here" in content
+
 
 class TestConvertAnthropicToolsToInternal:
     """Tests for convert_anthropic_tools_to_internal function."""
@@ -882,6 +1145,23 @@ class TestExtractHarmonyMessages:
         assert "tool_calls" in result[0]
         assert len(result[0]["tool_calls"]) == 1
         assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+
+    def test_tool_message_with_content_part_list(self):
+        """Test that tool messages with ContentPart list content are extracted properly."""
+        messages = [
+            Message(
+                role="tool",
+                content=[ContentPart(type="text", text='{"result": "success"}')],
+                tool_call_id="call_123",
+            )
+        ]
+
+        result = extract_harmony_messages(messages)
+
+        assert result[0]["role"] == "tool"
+        assert result[0]["tool_call_id"] == "call_123"
+        # Harmony parses JSON content via _try_parse_json for |tojson compatibility
+        assert not isinstance(result[0]["content"], list)
 
     def test_json_arguments_parsed(self):
         """Test that JSON arguments are parsed to dict."""
@@ -1186,6 +1466,24 @@ class TestMergeConsecutiveRoles:
 
 class TestExtractMultimodalContent:
     """Tests for extract_multimodal_content normalization."""
+
+    def test_tool_message_with_content_part_list(self):
+        """Test that tool messages with ContentPart list content are converted to string."""
+        messages = [
+            Message(
+                role="tool",
+                content=[ContentPart(type="text", text='{"result": "success"}')],
+                tool_call_id="call_123",
+            )
+        ]
+
+        result = extract_multimodal_content(messages)
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"  # Converted to user (no has_tool_calling)
+        assert "call_123" in result[0]["content"]
+        assert "success" in result[0]["content"]
+        assert isinstance(result[0]["content"], str)
 
     def test_converts_input_text_and_input_image(self):
         """Responses-style input_text/input_image should normalize for VLM."""

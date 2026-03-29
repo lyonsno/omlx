@@ -12,7 +12,7 @@
 
         <!-- Modal -->
         <div class="flex min-h-full items-center justify-center p-4">
-            <div class="relative bg-white rounded-3xl shadow-2xl w-full max-w-4xl p-8"
+            <div class="relative bg-white rounded-2xl sm:rounded-3xl shadow-2xl w-full max-w-4xl p-4 sm:p-8"
                  @click.stop
                  x-transition:enter="transition ease-out duration-200"
                  x-transition:enter-start="opacity-0 scale-95"
@@ -34,13 +34,13 @@
                 </div>
 
                 <!-- Two-column layout -->
-                <div class="flex">
+                <div class="flex flex-col lg:flex-row">
                     <!-- Left: Basic Settings -->
-                    <div class="w-3/5 pr-6 border-r border-neutral-200">
+                    <div class="w-full lg:w-3/5 lg:pr-6 lg:border-r border-neutral-200">
                         <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-5">{{ t('modal.model_settings.basic_label') }}</h3>
                         <div class="space-y-5">
-                            <!-- Row 1: Model Alias / Model Type -->
-                            <div class="grid grid-cols-2 gap-4">
+                            <!-- Row 1: Model Alias / Model Type / Reasoning Parser -->
+                            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
                                 <div>
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.model_alias') }}</label>
                                     <input type="text" x-model="modelSettings.model_alias"
@@ -56,6 +56,24 @@
                                         <option value="vlm">VLM</option>
                                         <option value="embedding">Embedding</option>
                                         <option value="reranker">Reranker</option>
+                                        <option value="audio_stt">Audio STT</option>
+                                        <option value="audio_tts">Audio TTS</option>
+                                        <option value="audio_sts">Audio STS</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Reasoning Parser</label>
+                                    <select x-model="modelSettings.reasoning_parser"
+                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <option value="">None</option>
+                                        <option value="qwen">Qwen</option>
+                                        <option value="qwen_coder">Qwen Coder</option>
+                                        <option value="harmony">Harmony (gpt-oss)</option>
+                                        <option value="llama">Llama</option>
+                                        <option value="deepseek_r1">DeepSeek R1</option>
+                                        <option value="deepseek_v3_2">DeepSeek V3.2</option>
+                                        <option value="kimi">Kimi</option>
+                                        <option value="minimax">MiniMax</option>
                                     </select>
                                 </div>
                             </div>
@@ -64,7 +82,7 @@
                             <template x-if="!selectedModel?.model_type || selectedModel.model_type === 'llm' || selectedModel.model_type === 'vlm'">
                                 <div class="space-y-5">
                                     <!-- Row 2: Ctx Window / Max Tokens / Temperature -->
-                                    <div class="grid grid-cols-3 gap-4">
+                                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_context_window') }}</label>
                                             <input type="number" x-model.number="modelSettings.max_context_window" placeholder="{{ t('modal.model_settings.placeholder_default') }}" min="1"
@@ -83,7 +101,7 @@
                                     </div>
 
                                     <!-- Row 3: Top P / Top K / Min P -->
-                                    <div class="grid grid-cols-3 gap-4">
+                                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.top_p') }}</label>
                                             <input type="number" x-model.number="modelSettings.top_p" step="0.05" min="0" max="1" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
@@ -102,7 +120,7 @@
                                     </div>
 
                                     <!-- Row 4: Repetition Penalty / Presence Penalty -->
-                                    <div class="grid grid-cols-2 gap-4">
+                                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.repetition_penalty') }}</label>
                                             <input type="number" x-model.number="modelSettings.repetition_penalty" step="0.05" min="0" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
@@ -118,7 +136,7 @@
                             </template>
 
                             <!-- TTL (all model types) -->
-                            <div class="grid grid-cols-2 gap-4">
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                                 <div>
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.ttl_seconds') }}</label>
                                     <input type="number" x-model.number="modelSettings.ttl_seconds"
@@ -145,7 +163,7 @@
                     </div>
 
                     <!-- Right: Advanced Settings -->
-                    <div class="w-2/5 pl-6">
+                    <div class="w-full lg:w-2/5 lg:pl-6 mt-6 lg:mt-0 pt-6 lg:pt-0 border-t lg:border-t-0 border-neutral-200">
                         <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-5">{{ t('modal.model_settings.advanced_label') }}</h3>
                         <div class="overflow-y-auto max-h-[28rem] space-y-4 pr-1"
                              x-show="!selectedModel?.model_type || selectedModel.model_type === 'llm' || selectedModel.model_type === 'vlm'">
@@ -302,6 +320,8 @@
 
                             <!-- Experimental Features -->
                             <h4 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.experimental_label') }}</h4>
+
+                                <!-- TurboQuant KV Cache (temporarily disabled) -->
 
                                 <!-- IndexCache (DSA models only) -->
                                 <template x-if="DSA_MODEL_TYPES.has(selectedModel?.config_model_type || '')">

@@ -18,6 +18,7 @@ from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
 
+
 # Optional Harmony adapter import
 try:
     from ..adapter.harmony import preprocess_harmony_messages
@@ -67,6 +68,8 @@ class BatchedEngine(BaseEngine):
         self._tokenizer = None
         self._engine = None
         self._loaded = False
+        self._grammar_compiler = None
+        self._grammar_compiler_init_attempted = False
 
     @property
     def model_name(self) -> str:
@@ -101,6 +104,26 @@ class BatchedEngine(BaseEngine):
         except Exception as e:
             logger.debug(f"Error getting model_type: {e}")
         return None
+
+    @property
+    def grammar_compiler(self):
+        """Lazily create and return a GrammarCompiler for this model.
+
+        Returns ``None`` when xgrammar is not installed or initialization fails.
+        """
+        if self._grammar_compiler is not None:
+            return self._grammar_compiler
+        if self._grammar_compiler_init_attempted:
+            return None
+        self._grammar_compiler_init_attempted = True
+        try:
+            from ..api.grammar import create_grammar_compiler
+
+            self._grammar_compiler = create_grammar_compiler(self._tokenizer, self._model)
+            logger.info("GrammarCompiler initialized for %s", self._model_name)
+        except Exception as e:
+            logger.warning("Failed to initialize GrammarCompiler: %s", e)
+        return self._grammar_compiler
 
     def _preprocess_messages(
         self, messages: list[dict[str, Any]]
@@ -160,6 +183,15 @@ class BatchedEngine(BaseEngine):
             self._model, self._model_settings
         )
 
+        # TurboQuant KV cache: patch attention and set kv_bits on scheduler
+        if self._model_settings is not None:
+            tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
+            if tq_enabled:
+                from ..patches.turboquant_attention import apply_turboquant_attention_patch
+                apply_turboquant_attention_patch()
+                tq_bits = int(getattr(self._model_settings, "turboquant_kv_bits", 4))
+                logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
+
         # Create engine config (copy to avoid mutating the shared instance)
         scheduler_config = copy.copy(self._scheduler_config) if self._scheduler_config else SchedulerConfig()
         scheduler_config.model_name = self._model_name  # Ensure cache isolation per model
@@ -177,6 +209,13 @@ class BatchedEngine(BaseEngine):
         )
 
         await self._engine.engine.start()
+
+        # TurboQuant KV cache: propagate bits to scheduler
+        if self._model_settings is not None:
+            tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
+            if tq_enabled:
+                tq_bits = int(getattr(self._model_settings, "turboquant_kv_bits", 4))
+                self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:
@@ -325,11 +364,14 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
+            xtc_probability=kwargs.get("xtc_probability", 0.0),
+            xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
             thinking_budget=kwargs.get("thinking_budget", None),
+            compiled_grammar=kwargs.get("compiled_grammar", None),
         )
 
         output = await self._engine.generate(
@@ -390,11 +432,14 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
+            xtc_probability=kwargs.get("xtc_probability", 0.0),
+            xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
             thinking_budget=kwargs.get("thinking_budget", None),
+            compiled_grammar=kwargs.get("compiled_grammar", None),
         )
 
         # SpecPrefill: pass per-request overrides to engine
@@ -403,6 +448,8 @@ class BatchedEngine(BaseEngine):
             specprefill_kwargs["specprefill"] = kwargs.pop("specprefill")
         if kwargs.get("specprefill_keep_pct") is not None:
             specprefill_kwargs["specprefill_keep_pct"] = kwargs.pop("specprefill_keep_pct")
+        if kwargs.get("specprefill_threshold") is not None:
+            specprefill_kwargs["specprefill_threshold"] = kwargs.pop("specprefill_threshold")
         if kwargs.get("specprefill_system_end") is not None:
             specprefill_kwargs["specprefill_system_end"] = kwargs.pop("specprefill_system_end")
 

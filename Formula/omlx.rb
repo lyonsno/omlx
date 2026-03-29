@@ -1,9 +1,11 @@
 class Omlx < Formula
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jundot/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.2.19.tar.gz"
-  sha256 "88a2ce3f3a03ac02b4ff5d5343ba17c4809d31bdb29eb07ba636ba9008b9fd15"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.2.24.tar.gz"
+  sha256 "08ce4b8c910548f9627943740212f7655d52b10ea025e037f88d4100a53c89c9"
   license "Apache-2.0"
+
+  head "https://github.com/jundot/omlx.git", branch: "main"
 
   depends_on "rust" => :build
   depends_on "python@3.11"
@@ -23,13 +25,10 @@ class Omlx < Formula
     # Create venv with pip so dependency resolution works properly
     system "python3.11", "-m", "venv", libexec
 
-    # Upgrade pip to ensure modern resolver (handles git deps, etc.)
-    system libexec/"bin/pip", "install", "--upgrade", "pip"
-
     # Build Rust-based packages from source with headerpad to prevent
     # Homebrew dylib ID fixup failure (Mach-O header too small for absolute paths)
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
-    system libexec/"bin/pip", "install", "--no-binary", "pydantic-core,rpds-py,tiktoken,tokenizers", buildpath
+    system libexec/"bin/pip", "install", "--no-binary", "pydantic-core,rpds-py,tiktoken,tokenizers", "#{buildpath}[audio]"
 
     bin.install_symlink Dir[libexec/"bin/omlx"]
   end

@@ -161,6 +161,8 @@ class VLMBatchedEngine(BaseEngine):
         self._adapter = None
         self._engine = None
         self._loaded = False
+        self._grammar_compiler = None
+        self._grammar_compiler_init_attempted = False
 
     @property
     def model_name(self) -> str:
@@ -181,6 +183,23 @@ class VLMBatchedEngine(BaseEngine):
     @property
     def is_ocr_model(self) -> bool:
         return (self.model_type or "") in OCR_MODEL_TYPES
+
+    @property
+    def grammar_compiler(self):
+        """Lazily create and return a GrammarCompiler for this VLM model."""
+        if self._grammar_compiler is not None:
+            return self._grammar_compiler
+        if self._grammar_compiler_init_attempted:
+            return None
+        self._grammar_compiler_init_attempted = True
+        try:
+            from ..api.grammar import create_grammar_compiler
+
+            self._grammar_compiler = create_grammar_compiler(self._tokenizer, self._vlm_model)
+            logger.info("GrammarCompiler initialized for %s", self._model_name)
+        except Exception as e:
+            logger.warning("Failed to initialize GrammarCompiler: %s", e)
+        return self._grammar_compiler
 
     def _resolve_ocr_stop_token_ids(self) -> list[int]:
         """Convert OCR stop sequences to token IDs via the tokenizer.
@@ -265,6 +284,16 @@ class VLMBatchedEngine(BaseEngine):
         )
 
         await self._engine.engine.start()
+
+        # TurboQuant KV cache
+        if self._model_settings is not None:
+            tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
+            if tq_enabled:
+                from ..patches.turboquant_attention import apply_turboquant_attention_patch
+                apply_turboquant_attention_patch()
+                tq_bits = int(getattr(self._model_settings, "turboquant_kv_bits", 4))
+                self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
+                logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:
@@ -524,6 +553,26 @@ class VLMBatchedEngine(BaseEngine):
             prompt = template_target.apply_chat_template(
                 formatted_messages, **template_kwargs
             )
+        except ValueError:
+            # Processor has apply_chat_template but no chat_template set
+            # (e.g. mlx-vlm custom processor without processor_config.json).
+            # Fall back to processor.tokenizer which holds the actual template.
+            fallback = getattr(self._processor, "tokenizer", None)
+            if fallback is not None and fallback is not template_target:
+                try:
+                    prompt = fallback.apply_chat_template(
+                        formatted_messages, **template_kwargs
+                    )
+                except TypeError:
+                    if chat_template_kwargs:
+                        for key in chat_template_kwargs:
+                            template_kwargs.pop(key, None)
+                    template_kwargs.pop("enable_thinking", None)
+                    prompt = fallback.apply_chat_template(
+                        formatted_messages, **template_kwargs
+                    )
+            else:
+                raise
 
         # Tokenize text and preprocess images
         inputs = prepare_inputs(
@@ -644,11 +693,14 @@ class VLMBatchedEngine(BaseEngine):
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
+            xtc_probability=kwargs.get("xtc_probability", 0.0),
+            xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
             stop=stop or [],
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
+            compiled_grammar=kwargs.get("compiled_grammar", None),
         )
 
         output = await self._engine.generate(
@@ -706,11 +758,14 @@ class VLMBatchedEngine(BaseEngine):
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
+            xtc_probability=kwargs.get("xtc_probability", 0.0),
+            xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
             stop=stop or [],
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
+            compiled_grammar=kwargs.get("compiled_grammar", None),
         )
 
         # SpecPrefill: pass per-request overrides

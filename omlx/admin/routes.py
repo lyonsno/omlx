@@ -93,11 +93,15 @@ class ModelSettingsRequest(BaseModel):
     index_cache_freq: Optional[int] = None
     thinking_budget_enabled: Optional[bool] = None
     thinking_budget_tokens: Optional[int] = None
+    # TurboQuant KV cache (experimental)
+    turboquant_kv_enabled: Optional[bool] = None
+    turboquant_kv_bits: Optional[int] = None
     # SpecPrefill (experimental)
     specprefill_enabled: Optional[bool] = None
     specprefill_draft_model: Optional[str] = None
     specprefill_keep_pct: Optional[float] = None
     specprefill_threshold: Optional[int] = None
+    reasoning_parser: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
 
@@ -205,10 +209,28 @@ class OQStartRequest(BaseModel):
     group_size: int = 64
     clip_num_samples: int = 128
     clip_seq_length: int = 512
-    clip_n_grid: int = 20
     calib_dataset: str = "default"
     clip_batch_size: int = 1024
+    sensitivity_model_path: str = ""
     text_only: bool = False
+    expert_batch_size: int = 32
+
+
+class HFUploadRequest(BaseModel):
+    """Request model for starting a HuggingFace upload task."""
+
+    model_path: str
+    repo_id: str
+    hf_token: str
+    readme_source_path: str = ""
+    auto_readme: bool = True
+    private: bool = False
+
+
+class HFValidateTokenRequest(BaseModel):
+    """Request model for validating a HuggingFace token."""
+
+    hf_token: str
 
 
 # =============================================================================
@@ -701,6 +723,7 @@ _get_global_settings = None
 _hf_downloader = None
 _ms_downloader = None
 _oq_manager = None
+_hf_uploader = None
 
 
 def set_admin_getters(
@@ -757,6 +780,16 @@ def set_oq_manager(manager):
     """
     global _oq_manager
     _oq_manager = manager
+
+
+def set_hf_uploader(uploader):
+    """Set the HFUploader instance for admin routes.
+
+    Args:
+        uploader: HFUploader instance created during server initialization.
+    """
+    global _hf_uploader
+    _hf_uploader = uploader
 
 
 # =============================================================================
@@ -872,11 +905,9 @@ async def login_page(request: Request):
     global_settings = _get_global_settings()
     api_key_configured = bool(global_settings and global_settings.auth.api_key)
     return templates.TemplateResponse(
+        request,
         "login.html",
-        {
-            "request": request,
-            "api_key_configured": api_key_configured,
-        },
+        {"api_key_configured": api_key_configured},
     )
 
 
@@ -890,7 +921,7 @@ async def dashboard_page(request: Request, is_admin: bool = Depends(require_admi
     Returns:
         HTML dashboard page with server status and model list.
     """
-    return templates.TemplateResponse("dashboard.html", {"request": request})
+    return templates.TemplateResponse(request, "dashboard.html", {})
 
 
 @router.get("/chat", response_class=HTMLResponse)
@@ -909,7 +940,7 @@ async def chat_page(request: Request, is_admin: bool = Depends(require_admin)):
     global_settings = _get_global_settings()
     api_key = global_settings.auth.api_key if global_settings else ""
     return templates.TemplateResponse(
-        "chat.html", {"request": request, "api_key": api_key or ""}
+        request, "chat.html", {"api_key": api_key or ""}
     )
 
 
@@ -1280,10 +1311,13 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "max_tool_result_tokens": settings.max_tool_result_tokens,
                 "thinking_budget_enabled": settings.thinking_budget_enabled,
                 "thinking_budget_tokens": settings.thinking_budget_tokens,
+                "reasoning_parser": settings.reasoning_parser,
                 "chat_template_kwargs": settings.chat_template_kwargs,
                 "forced_ct_kwargs": settings.forced_ct_kwargs,
                 "ttl_seconds": settings.ttl_seconds,
                 "index_cache_freq": settings.index_cache_freq,
+                "turboquant_kv_enabled": settings.turboquant_kv_enabled,
+                "turboquant_kv_bits": settings.turboquant_kv_bits,
                 "specprefill_enabled": settings.specprefill_enabled,
                 "specprefill_draft_model": settings.specprefill_draft_model,
                 "specprefill_keep_pct": settings.specprefill_keep_pct,
@@ -1418,7 +1452,7 @@ async def update_model_settings(
                     )
         current_settings.model_alias = alias_value
     if "model_type_override" in sent:
-        valid_types = {"llm", "vlm", "embedding", "reranker"}
+        valid_types = {"llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"}
         # Treat empty string as None (auto-detect)
         override_value = request.model_type_override or None
         if override_value is not None and override_value not in valid_types:
@@ -1433,6 +1467,9 @@ async def update_model_settings(
             "vlm": "vlm",
             "embedding": "embedding",
             "reranker": "reranker",
+            "audio_stt": "audio_stt",
+            "audio_tts": "audio_tts",
+            "audio_sts": "audio_sts",
         }
         if override_value:
             entry.model_type = override_value
@@ -1488,6 +1525,11 @@ async def update_model_settings(
             if request.index_cache_freq and request.index_cache_freq >= 2
             else None
         )
+    # TurboQuant KV cache settings (temporarily disabled - ignore any values)
+    # if "turboquant_kv_enabled" in sent:
+    #     current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
+    # if "turboquant_kv_bits" in sent:
+    #     current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False
@@ -1498,6 +1540,8 @@ async def update_model_settings(
     if "specprefill_threshold" in sent:
         current_settings.specprefill_threshold = request.specprefill_threshold or None
 
+    if "reasoning_parser" in sent:
+        current_settings.reasoning_parser = request.reasoning_parser or None
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
         # Also update the engine pool entry
@@ -1605,6 +1649,18 @@ async def get_generation_config(
                 or model_config.get("seq_length")
                 or model_config.get("n_positions")
             )
+
+            # Nested config fallback (VLM, MoE models like Qwen3.5, GLM-4V)
+            if not max_pos:
+                text_config = model_config.get("text_config", {})
+                if isinstance(text_config, dict):
+                    max_pos = (
+                        text_config.get("max_position_embeddings")
+                        or text_config.get("max_seq_len")
+                        or text_config.get("seq_length")
+                        or text_config.get("n_positions")
+                    )
+
             if max_pos and isinstance(max_pos, int):
                 result["max_context_window"] = max_pos
 
@@ -1670,6 +1726,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         },
         "memory": {
             "max_process_memory": global_settings.memory.max_process_memory,
+            "prefill_memory_guard": global_settings.memory.prefill_memory_guard,
         },
         "scheduler": {
             "max_num_seqs": global_settings.scheduler.max_num_seqs,
@@ -2223,6 +2280,7 @@ def _get_engine_info() -> dict:
         "mlx-lm": "https://github.com/ml-explore/mlx-lm",
         "mlx-vlm": "https://github.com/Blaizzy/mlx-vlm",
         "mlx-embeddings": "https://github.com/Blaizzy/mlx-embeddings",
+        "mlx-audio": "https://github.com/Blaizzy/mlx-audio",
     }
 
     fallback_commits = _load_fallback_commits(packages)
@@ -2470,6 +2528,25 @@ def _build_runtime_cache_observability(
             block_sizes.add(block_size)
 
     payload["effective_block_sizes"] = sorted(block_sizes)
+
+    # Fallback: if no loaded models contributed stats, scan the cache
+    # directory directly so the dashboard still shows real disk usage.
+    if payload["total_num_files"] == 0 and cache_dir.exists():
+        try:
+            num_files = 0
+            total_bytes = 0
+            for subdir in "0123456789abcdef":
+                subdir_path = cache_dir / subdir
+                if not subdir_path.exists():
+                    continue
+                for f in subdir_path.glob("*.safetensors"):
+                    num_files += 1
+                    total_bytes += f.stat().st_size
+            payload["total_num_files"] = num_files
+            payload["total_size_bytes"] = total_bytes
+        except Exception as exc:
+            logger.warning("Failed to scan SSD cache directory: %s", exc)
+
     return payload
 
 
@@ -2624,6 +2701,73 @@ async def clear_alltime_stats(is_admin: bool = Depends(require_admin)):
 
     get_server_metrics().clear_alltime_metrics()
     return {"status": "ok"}
+
+
+@router.post("/api/ssd-cache/clear")
+async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
+    """Clear all SSD cache files for all loaded models.
+
+    Uses loaded models' SSD cache managers when available.  Falls back to
+    direct filesystem deletion so caches can be wiped even when no model
+    is loaded.
+    """
+    total_deleted = 0
+
+    # Phase 1: clear via loaded models' cache managers (updates in-memory index)
+    engine_pool = _get_engine_pool()
+    if engine_pool is not None:
+        for model_info in engine_pool.get_status().get("models", []):
+            model_id = model_info.get("id")
+            if not model_id or not model_info.get("loaded"):
+                continue
+
+            entry = engine_pool._entries.get(model_id)
+            if entry is None or entry.engine is None:
+                continue
+
+            async_core = getattr(entry.engine, "_engine", None)
+            core = (
+                getattr(async_core, "engine", None) if async_core is not None else None
+            )
+            scheduler = (
+                getattr(core, "scheduler", None) if core is not None else None
+            )
+
+            if scheduler is not None:
+                ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+                if ssd_manager is not None:
+                    try:
+                        deleted = ssd_manager.clear()
+                        total_deleted += deleted
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to clear SSD cache for model '%s': %s",
+                            model_id,
+                            exc,
+                        )
+
+    # Phase 2: remove any remaining files on disk (covers unloaded models)
+    global_settings = _get_global_settings()
+    if global_settings is not None:
+        cache_dir = global_settings.cache.get_ssd_cache_dir(
+            global_settings.base_path,
+        )
+        if cache_dir.exists():
+            try:
+                for subdir in "0123456789abcdef":
+                    subdir_path = cache_dir / subdir
+                    if not subdir_path.exists():
+                        continue
+                    for f in subdir_path.glob("*.safetensors"):
+                        try:
+                            f.unlink()
+                            total_deleted += 1
+                        except OSError:
+                            pass
+            except Exception as exc:
+                logger.warning("Failed to clean SSD cache directory: %s", exc)
+
+    return {"status": "ok", "total_deleted": total_deleted}
 
 
 # =============================================================================
@@ -3575,8 +3719,8 @@ async def list_oq_models(is_admin: bool = Depends(require_admin)):
         raise HTTPException(
             status_code=503, detail="oQ quantizer not initialized"
         )
-    models = await _oq_manager.list_quantizable_models()
-    return {"models": models}
+    source_models, all_models = await _oq_manager.list_quantizable_models()
+    return {"models": source_models, "all_models": all_models}
 
 
 @router.get("/api/oq/estimate")
@@ -3620,10 +3764,11 @@ async def start_oq_quantization(
             group_size=request.group_size,
             clip_num_samples=request.clip_num_samples,
             clip_seq_length=request.clip_seq_length,
-            clip_n_grid=request.clip_n_grid,
             calib_dataset=request.calib_dataset,
             clip_batch_size=request.clip_batch_size,
+            sensitivity_model_path=request.sensitivity_model_path,
             text_only=request.text_only,
+            expert_batch_size=request.expert_batch_size,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:
@@ -3667,6 +3812,108 @@ async def remove_oq_task(
             status_code=503, detail="oQ quantizer not initialized"
         )
     success = _oq_manager.remove_task(task_id)
+    if not success:
+        raise HTTPException(
+            status_code=404, detail="Task not found or still active"
+        )
+    return {"success": True}
+
+
+# =============================================================================
+# HuggingFace Upload Endpoints
+# =============================================================================
+
+
+@router.post("/api/upload/validate-token")
+async def validate_upload_token(
+    request: HFValidateTokenRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Validate a HuggingFace token and return user info."""
+    if _hf_uploader is None:
+        raise HTTPException(
+            status_code=503, detail="HF Uploader not initialized"
+        )
+    try:
+        result = await _hf_uploader.validate_token(request.hf_token)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/api/upload/oq-models")
+async def list_upload_oq_models(is_admin: bool = Depends(require_admin)):
+    """List local oQ models available for upload."""
+    if _hf_uploader is None:
+        raise HTTPException(
+            status_code=503, detail="HF Uploader not initialized"
+        )
+    oq_models = await _hf_uploader.list_oq_models()
+    all_models = await _hf_uploader.list_all_models()
+    return {"oq_models": oq_models, "all_models": all_models}
+
+
+@router.post("/api/upload/start")
+async def start_upload(
+    request: HFUploadRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Start an upload task to HuggingFace Hub."""
+    if _hf_uploader is None:
+        raise HTTPException(
+            status_code=503, detail="HF Uploader not initialized"
+        )
+    try:
+        task = await _hf_uploader.start_upload(
+            model_path=request.model_path,
+            repo_id=request.repo_id,
+            token=request.hf_token,
+            readme_source_path=request.readme_source_path,
+            auto_readme=request.auto_readme,
+            private=request.private,
+        )
+        return {"success": True, "task": task.to_dict()}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/api/upload/tasks")
+async def list_upload_tasks(is_admin: bool = Depends(require_admin)):
+    """List all upload tasks."""
+    if _hf_uploader is None:
+        raise HTTPException(
+            status_code=503, detail="HF Uploader not initialized"
+        )
+    return {"tasks": _hf_uploader.get_tasks()}
+
+
+@router.post("/api/upload/cancel/{task_id}")
+async def cancel_upload_task(
+    task_id: str, is_admin: bool = Depends(require_admin)
+):
+    """Cancel an active or pending upload task."""
+    if _hf_uploader is None:
+        raise HTTPException(
+            status_code=503, detail="HF Uploader not initialized"
+        )
+    success = await _hf_uploader.cancel_upload(task_id)
+    if not success:
+        raise HTTPException(
+            status_code=404, detail="Task not found or not cancellable"
+        )
+    return {"success": True}
+
+
+@router.delete("/api/upload/task/{task_id}")
+async def remove_upload_task(
+    task_id: str, is_admin: bool = Depends(require_admin)
+):
+    """Remove a completed/failed/cancelled upload task."""
+    if _hf_uploader is None:
+        raise HTTPException(
+            status_code=503, detail="HF Uploader not initialized"
+        )
+    success = _hf_uploader.remove_task(task_id)
     if not success:
         raise HTTPException(
             status_code=404, detail="Task not found or still active"

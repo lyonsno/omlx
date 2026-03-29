@@ -36,7 +36,7 @@ pytestmark = [
 
 MODELS = {
     "kvcache": {
-        "path": "/Users/cryingneko/Workspace/models/MiniMax-M2.5-3bit",
+        "path": "/Users/cryingneko/Workspace/models/MiniMax-M2.5-oQ3e",
         "desc": "KVCache only (MiniMax-M2.5)",
         "expect_on_off_match": True,
     },
@@ -46,7 +46,7 @@ MODELS = {
         "expect_on_off_match": True,
     },
     "arrayscache_moe": {
-        "path": "/Users/cryingneko/Workspace/models/Qwen3.5-35B-A3B-8bit",
+        "path": "/Users/cryingneko/Workspace/models/Qwen3.5-35B-A3B-oQ4",
         "desc": "ArraysCache hybrid MoE (Qwen3.5-35B-A3B)",
         "expect_on_off_match": True,
     },
@@ -54,6 +54,11 @@ MODELS = {
         "path": "/Volumes/SSD/Models/gpt-oss-120b-MXFP4-Q8",
         "desc": "RotatingKVCache+KVCache hybrid (gpt-oss-120b)",
         "expect_on_off_match": False,  # chunk size differs, quality-only check
+    },
+    "rotating_vlm": {
+        "path": "/Users/cryingneko/Workspace/models/gemma-3-12b-it-qat-4bit",
+        "desc": "RotatingKVCache+KVCache VLM hybrid (Gemma3-12B-QAT)",
+        "expect_on_off_match": False,  # chunk size differs for RotatingKVCache
     },
 }
 
