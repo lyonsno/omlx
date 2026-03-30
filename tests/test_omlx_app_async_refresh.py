@@ -345,9 +345,6 @@ class TestAsyncStatsRefreshContract:
     ):
         """Request failures still consume the polling interval, matching upstream behavior."""
         delegate = _make_delegate(app_module, last_stats_fetch=17.0, in_flight=True)
-        delegate._fetch_stats_snapshot = (
-            app_module.OMLXAppDelegate._fetch_stats_snapshot.__get__(delegate)
-        )
 
         failing_session = Mock()
         failing_session.get.side_effect = app_module.requests.RequestException(
@@ -439,9 +436,6 @@ class TestAsyncStatsRefreshContract:
     def test_invalidated_generations_do_not_share_worker_sessions(self, app_module):
         """Old and new generation workers should not reuse the same Session object."""
         delegate = _make_delegate(app_module, in_flight=True, refresh_token=0)
-        delegate._fetch_stats_snapshot = (
-            app_module.OMLXAppDelegate._fetch_stats_snapshot.__get__(delegate)
-        )
 
         session_one = Mock()
         session_one.get.side_effect = [
@@ -604,15 +598,17 @@ class TestAsyncStatsRefreshContract:
         assert delegate._cached_stats is None
         assert delegate._cached_alltime_stats is None
 
-    def test_invalidate_generation_closes_admin_session(self, app_module):
-        """Generation invalidation should close and clear the cached admin session."""
+    def test_invalidate_generation_clears_admin_session_without_closing(self, app_module):
+        """Generation invalidation should drop the session reference but not
+        close it eagerly — the in-flight worker still holds a reference and
+        the stale-token rejection in the completion handler closes it."""
         delegate = _make_delegate(app_module, refresh_token=4)
         session = Mock()
         delegate._admin_session = session
 
         app_module.OMLXAppDelegate._invalidate_stats_refresh_generation(delegate)
 
-        session.close.assert_called_once_with()
+        session.close.assert_not_called()
         assert delegate._stats_refresh_token == 5
         assert delegate._admin_session is None
 
@@ -792,11 +788,6 @@ class TestAsyncStatsRefreshContract:
         self, app_module, pass_existing_session, login_status, stats_retry_status
     ):
         """Failure paths should close sessions whose ownership is dropped by the snapshot fetch."""
-        delegate = _make_delegate(app_module)
-        delegate._fetch_stats_snapshot = (
-            app_module.OMLXAppDelegate._fetch_stats_snapshot.__get__(delegate)
-        )
-
         session = Mock()
         responses = [_make_response(401)]  # initial stats -> 401 triggers login
         responses.append(_make_response(login_status))
@@ -807,8 +798,9 @@ class TestAsyncStatsRefreshContract:
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(app_module.requests, "Session", Mock(return_value=session))
-            stats, alltime, returned_session = delegate._fetch_stats_snapshot(
-                session if pass_existing_session else None
+            stats, alltime, returned_session = app_module.OMLXAppDelegate._fetch_stats_snapshot(
+                "test-key", "http://127.0.0.1:11434",
+                session if pass_existing_session else None,
             )
 
         assert stats is None
@@ -821,18 +813,14 @@ class TestAsyncStatsRefreshContract:
         self, app_module, pass_existing_session
     ):
         """Request exceptions should also close sessions whose ownership is abandoned."""
-        delegate = _make_delegate(app_module)
-        delegate._fetch_stats_snapshot = (
-            app_module.OMLXAppDelegate._fetch_stats_snapshot.__get__(delegate)
-        )
-
         session = Mock()
         session.get.side_effect = app_module.requests.RequestException("boom")
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(app_module.requests, "Session", Mock(return_value=session))
-            stats, alltime, returned_session = delegate._fetch_stats_snapshot(
-                session if pass_existing_session else None
+            stats, alltime, returned_session = app_module.OMLXAppDelegate._fetch_stats_snapshot(
+                "test-key", "http://127.0.0.1:11434",
+                session if pass_existing_session else None,
             )
 
         assert stats is None

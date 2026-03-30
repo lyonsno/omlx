@@ -848,14 +848,19 @@ class OMLXAppDelegate(NSObject):
             logger.debug(f"Failed closing session: {e}")
 
     def _invalidate_stats_refresh_generation(self):
-        """Discard refresh results and timing state from an old server generation."""
+        """Discard refresh results and timing state from an old server generation.
+
+        The in-flight worker (if any) still holds the old session reference.
+        It will be closed by the stale-token rejection in the completion handler
+        when the worker finishes, so we do not close it eagerly here.
+        """
         self._stats_refresh_token += 1
         self._last_stats_fetch = 0
         self._last_stats_refresh_started_at = 0
         self._stats_refresh_in_flight = False
         self._cached_stats = None
         self._cached_alltime_stats = None
-        self._close_admin_session()
+        self._admin_session = None
 
     def _on_server_status_changed(self, status):
         """Marshal background server status changes onto the main thread."""
@@ -873,22 +878,30 @@ class OMLXAppDelegate(NSObject):
 
     # --- Stats fetching ---
 
+    @staticmethod
     def _fetch_stats_snapshot(
-        self, session: requests.Session | None = None
+        api_key: str | None,
+        base_url: str,
+        session: requests.Session | None = None,
     ) -> tuple[dict | None, dict | None, requests.Session | None]:
         """Fetch serving stats from the admin API and return a snapshot.
 
-        Reuses a persistent session to avoid re-login on every poll cycle.
-        The caller only hands a session to one refresh worker at a time, so
-        the cached session is reused serially rather than shared by overlapping
-        worker threads.
+        This is a staticmethod so the background worker never touches ``self``.
+        The caller snapshots the api_key, base_url, and session before dispatch;
+        the worker operates only on those copies.
+
         Only calls /admin/api/login when the session cookie is missing or
         expired (server returns 401).
         """
-        try:
-            api_key = self.config.get_server_api_key()
-            base_url = f"http://127.0.0.1:{self.config.port}"
+        def _close(s):
+            if s is None:
+                return
+            try:
+                s.close()
+            except Exception:
+                pass
 
+        try:
             if not api_key:
                 return None, None, None
 
@@ -909,7 +922,7 @@ class OMLXAppDelegate(NSObject):
                     timeout=2,
                 )
                 if login_resp.status_code != 200:
-                    self._close_session(session)
+                    _close(session)
                     return None, None, None
 
                 stats_resp = session.get(
@@ -920,7 +933,7 @@ class OMLXAppDelegate(NSObject):
             if stats_resp.status_code == 200:
                 stats = stats_resp.json()
             else:
-                self._close_session(session)
+                _close(session)
                 return None, None, None
 
             alltime_resp = session.get(
@@ -936,24 +949,23 @@ class OMLXAppDelegate(NSObject):
             return stats, alltime, session
 
         except requests.RequestException:
-            self._close_session(session)
+            _close(session)
             return None, None, None
 
     # --- Timer callback ---
 
     def _start_stats_refresh(self):
         """Queue a non-blocking stats refresh worker."""
-        # The main thread owns the in-flight/token guards. Workers only receive
-        # snapshots and hand completion back onto the main thread.
+        # Snapshot everything the worker needs so it never reads self.
         refresh_token = self._stats_refresh_token
-        # The cached Session is reused serially because `_stats_refresh_in_flight`
-        # prevents overlapping refresh workers.
         refresh_session = self._admin_session
+        api_key = self.config.get_server_api_key()
+        base_url = f"http://127.0.0.1:{self.config.port}"
 
         def _worker():
             try:
-                stats, alltime_stats, session = self._fetch_stats_snapshot(
-                    refresh_session
+                stats, alltime_stats, session = OMLXAppDelegate._fetch_stats_snapshot(
+                    api_key, base_url, refresh_session
                 )
                 finished_at = time.time()
                 self.performSelectorOnMainThread_withObject_waitUntilDone_(
@@ -996,7 +1008,7 @@ class OMLXAppDelegate(NSObject):
         alltime_stats = payload.get("alltime_stats")
         session = payload.get("session")
 
-        if token is not None and token != self._stats_refresh_token:
+        if token != self._stats_refresh_token:
             self._close_session(session)
             return
         self._stats_refresh_in_flight = False
@@ -1031,7 +1043,7 @@ class OMLXAppDelegate(NSObject):
         token = payload.get("token")
         error_message = payload.get("error")
 
-        if token is not None and token != self._stats_refresh_token:
+        if token != self._stats_refresh_token:
             return
         self._stats_refresh_in_flight = False
         if error_message:
